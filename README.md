@@ -39,6 +39,8 @@ This mod works by using the same standard as the existing Retroarch capture core
     Example `MyGame.win` content:
     `MyGame.exe`
 
+    The "Capture Core Companion" from TeamGT's EmuVRX project can be used as a simple way to create compatible files for this mod 
+
 5.  **Scan for Games:**
     Run the EmuVR Game Scanner and add the new folder you created and click "Scan Games For EmuVR". It will automatically detect your new `.win` files as game cartridges. You can now grab them and insert them into any console to start playing!
 ----------------

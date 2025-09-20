@@ -41,6 +41,30 @@ This mod works by using the same standard as the existing Retroarch capture core
 5.  **Scan for Games:**
     Run the EmuVR Game Scanner and add the new folder you created and click "Scan Games For EmuVR". It will automatically detect your new `.win` files as game cartridges. You can now grab them and insert them into any console to start playing!
 ----------------
+Prerequisites for Compiling
+----------------
+Visual Studio 2022
+.NET 4.7.2 SDK
+EmuVR installation With WIGUx/Umbrella Modification
+----------------
+Instructions for Compiling
+----------------
+1. Clone the Git repo with 
+https://github.com/Earthbadger/WindowCaptureMod.git
+
+2. Open the cloned Git repo in your IDE of choice or terminal.
+
+3. Edit line 5 of the WindowCaptureModule.csproj and replace "REPLACE ME" with the path to your EmuVR installation
+ <EmuVRPath>REPLACE ME</EmuVRPath>
+
+4. Open the terminal and type
+   dotnet build -c Release
+   
+5. Compiled Binary will be in
+   .\bin\Release\net472
+   
+6. Copy WindowCaptureMod.dll to your EmuVR Installation's "Mods" folder
+----------------
 Why Create This?
 ----------------
 My reasoning for creating a mod that seperates window capture into its own thing is purely due to the fact of how EMUVR itself currently handles window capture.

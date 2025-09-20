@@ -55,8 +55,9 @@ https://github.com/Earthbadger/WindowCaptureMod.git
 2. Open the cloned Git repo in your IDE of choice or terminal.
 
 3. Edit line 5 of the WindowCaptureModule.csproj and replace "REPLACE ME" with the path to your EmuVR installation
- <EmuVRPath>REPLACE ME</EmuVRPath>
-
+```
+<EmuVRPath>REPLACE ME</EmuVRPath>
+```
 4. Open the terminal and type
    dotnet build -c Release
    

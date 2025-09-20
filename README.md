@@ -1,7 +1,4 @@
 # WindowCaptureMod
-----------------
-Description
-----------------
 Window Capture Modification For EmuVR Leveraging Melonloader &amp; The WIGUx/Umbrella Modification
 ----------------
 Releases

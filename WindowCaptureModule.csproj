@@ -1,7 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <EmuVRPath>C:\Users\Administrator\Desktop\EMUVRX</EmuVRPath>
+    <!-- This tells the compiler where your EmuVR path is -->
+    <EmuVRPath>REPLACE ME</EmuVRPath>
   </PropertyGroup>
 
   <PropertyGroup>
@@ -57,3 +58,4 @@
   </ItemGroup>
 
 </Project>
+

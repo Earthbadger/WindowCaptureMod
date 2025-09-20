@@ -28,17 +28,18 @@ This mod works by using the same standard as the existing Retroarch capture core
 2.  **Create a .bat Launcher:**
     Inside your new folder, create a batch file (`.bat`) to launch your game. For example, create `MyGame.bat`.
     The content should be simple, like:
-    `start "" "MyGame.exe"`
+    `cd /d "Path To Game"
+     "MyGame.exe"`
     (Replace "MyGame.exe" with the actual name of your game's executable.)
 
-3.  **Create a .win "File":**
+4.  **Create a .win "File":**
     In the same folder, create a new text file and rename it to have a `.win` extension (e.g., `MyGame.win`).
     Open this file with a text editor and write the **exact name of the game's main window title OR the name of its process executable** (e.g., `MyGame.exe`). Using the process name is usually more reliable.
 
     Example `MyGame.win` content:
     `MyGame.exe`
 
-4.  **Scan for Games:**
+5.  **Scan for Games:**
     Run the EmuVR Game Scanner and add the new folder you created and click "Scan Games For EmuVR". It will automatically detect your new `.win` files as game cartridges. You can now grab them and insert them into any console to start playing!
 ----------------
 Why Create This?

@@ -1,0 +1,59 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <EmuVRPath>C:\Users\Administrator\Desktop\EMUVRX</EmuVRPath>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <!-- This tells the compiler what .NET version to use. -->
+    <TargetFramework>net472</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <!-- This will be the name of your final .dll file. -->
+    <AssemblyName>WindowCaptureMod</AssemblyName>
+    <OutputType>Library</OutputType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- These are the EmuVR and Unity libraries your mod needs. -->
+    <!-- Make sure these paths are correct for your EmuVR installation! -->
+    <Reference Include="Assembly-CSharp">
+      <HintPath>$(EmuVRPath)\EmuVR_Data\Managed\Assembly-CSharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(EmuVRPath)\EmuVR_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.AnimationModule">
+      <HintPath>$(EmuVRPath)\EmuVR_Data\Managed\UnityEngine.AnimationModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.InputModule">
+      <HintPath>$(EmuVRPath)\EmuVR_Data\Managed\UnityEngine.InputModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="WIGU">
+      <HintPath>$(EmuVRPath)\Mods\WIGU.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Mirror">
+      <HintPath>$(EmuVRPath)\EmuVR_Data\Managed\Mirror.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Newtonsoft.Json">
+      <HintPath>$(EmuVRPath)\EmuVR_Data\Managed\Newtonsoft.Json.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="System.Drawing" />
+    <Reference Include="MelonLoader">
+      <HintPath>$(EmuVRPath)\MelonLoader\net35\MelonLoader.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>$(EmuVRPath)\MelonLoader\net35\0Harmony.dll</HintPath>
+      <Private>false</Private>
+</Reference>
+
+  </ItemGroup>
+
+</Project>

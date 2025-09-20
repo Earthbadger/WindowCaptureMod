@@ -13,7 +13,7 @@ Prerequisites for Binary
 Installation
 ----------------
 1. Ensure all prerequisites are installed.
-2. Extract the contents of the Precompiled Binarys .7z directly into your EmuVR Mods folder.
+2. Put WindowCaptureMod.dll directly into your EmuVR Mods folder.
 ----------------
 How to Add Your Own Games
 ----------------

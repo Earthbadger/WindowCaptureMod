@@ -6,7 +6,7 @@ Window Capture Modification For EmuVR Leveraging Melonloader &amp; The WIGUx/Umb
 ----------------
 Releases
 ----------------
-
+https://github.com/Earthbadger/WindowCaptureMod/releases
 ----------------
 Prerequisites for Binary
 ----------------

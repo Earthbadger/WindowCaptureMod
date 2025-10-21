@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"path": "../EMUVR Source/Assembly-CSharp"
+		},
+		{
+			"path": "../WindowCaptureMod"
+		},
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"dotnet.preferCSharpExtension": true
+	}
+}

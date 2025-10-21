@@ -1,8 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <!-- This tells the compiler where your EmuVR path is -->
-    <EmuVRPath>REPLACE ME</EmuVRPath>
+    <EmuVRPath>C:\Users\Administrator\Desktop\EMUVRX</EmuVRPath>
   </PropertyGroup>
 
   <PropertyGroup>
@@ -33,6 +32,14 @@
       <HintPath>$(EmuVRPath)\EmuVR_Data\Managed\UnityEngine.InputModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="UnityEngine.AudioModule">
+      <HintPath>$(EmuVRPath)\EmuVR_Data\Managed\UnityEngine.AudioModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.PhysicsModule">
+      <HintPath>$(EmuVRPath)\EmuVR_Data\Managed\UnityEngine.PhysicsModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="WIGU">
       <HintPath>$(EmuVRPath)\Mods\WIGU.dll</HintPath>
       <Private>false</Private>
@@ -53,9 +60,11 @@
     <Reference Include="0Harmony">
       <HintPath>$(EmuVRPath)\MelonLoader\net35\0Harmony.dll</HintPath>
       <Private>false</Private>
-</Reference>
-
+    </Reference>
+         <Reference Include="Oculus.VR">
+      <HintPath>$(EmuVRPath)\EmuVR_Data\Managed\Oculus.VR.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
   </ItemGroup>
 
 </Project>
-

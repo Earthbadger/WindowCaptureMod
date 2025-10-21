@@ -1,9 +1,12 @@
 # WindowCaptureMod
+----------------
+Description
+----------------
 Window Capture Modification For EmuVR Leveraging Melonloader &amp; The WIGUx/Umbrella Modification
 ----------------
 Releases
 ----------------
-https://github.com/Earthbadger/WindowCaptureMod/releases
+
 ----------------
 Prerequisites for Binary
 ----------------
@@ -13,7 +16,7 @@ Prerequisites for Binary
 Installation
 ----------------
 1. Ensure all prerequisites are installed.
-2. Put WindowCaptureMod.dll directly into your EmuVR Mods folder.
+2. Extract the contents of the Precompiled Binarys .7z directly into your EmuVR Mods folder.
 ----------------
 How to Add Your Own Games
 ----------------
@@ -31,40 +34,30 @@ This mod works by using the same standard as the existing Retroarch capture core
 
 4.  **Create a .win "File":**
     In the same folder, create a new text file and rename it to have a `.win` extension (e.g., `MyGame.win`).
-    Open this file with a text editor and write the **exact name of the game's main window title OR the name of its process executable** (e.g., `MyGame.exe`). Using the process name is usually more reliable.
+    Open this file with a text editor and write the **exact name of the game's process executable** (e.g., `MyGame.exe`).
 
     Example `MyGame.win` content:
     `MyGame.exe`
 
-    The "Capture Core Companion" from TeamGT's EmuVRX project can be used as a simple way to create compatible files for this mod 
+5.  **Adjusting Touch Alignment (Optional):**
+    If you find the touch point isn't perfectly aligned with your fingertip, you can adjust it in real-time.
+    - **Right Hand:** Hold `Right Shift` and use the `Arrow Keys` to move the touch point.
+    - **Left Hand:** Hold `Left Shift` and use the `Arrow Keys` to move the touch point.
+    - **Reset:** Hold `Right Shift` and press `Page Up` to reset both hands' offsets to zero.
+    - **Check Current:** Hold `Right Shift` and press `Page Down` to log the current right-hand offset.
+    The offsets are saved automatically when you adjust them and will be remembered for the next session.
+
+----------------
+Troubleshooting
+----------------
+**Problem: The game only appears on the screen when I Alt+Tab away from it.**
+
+**Cause:** The game is running in "Exclusive Fullscreen" mode. This mode bypasses the default capture method.
+
+**Solution:** This capture mod automatically forces games into a borderless windowed mode to ensure compatibility. If you still encounter issues, try setting the game to a "Windowed" or "Borderless" mode in its own graphics settings before launching it through EmuVR.
 
 5.  **Scan for Games:**
     Run the EmuVR Game Scanner and add the new folder you created and click "Scan Games For EmuVR". It will automatically detect your new `.win` files as game cartridges. You can now grab them and insert them into any console to start playing!
-----------------
-Prerequisites for Compiling
-----------------
-Visual Studio 2022
-.NET 4.7.2 SDK
-EmuVR installation With WIGUx/Umbrella Modification
-----------------
-Instructions for Compiling
-----------------
-1. Clone the Git repo with 
-https://github.com/Earthbadger/WindowCaptureMod.git
-
-2. Open the cloned Git repo in your IDE of choice or terminal.
-
-3. Edit line 5 of the WindowCaptureModule.csproj and replace "REPLACE ME" with the path to your EmuVR installation
-```
-<EmuVRPath>REPLACE ME</EmuVRPath>
-```
-4. Open the terminal and type
-   dotnet build -c Release
-   
-5. Compiled Binary will be in
-   .\bin\Release\net472
-   
-6. Copy WindowCaptureMod.dll to your EmuVR Installation's "Mods" folder
 ----------------
 Why Create This?
 ----------------

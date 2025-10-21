@@ -2,181 +2,384 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
-using System.Runtime.InteropServices;
+using System.IO.MemoryMappedFiles;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using HarmonyLib;
 using UnityEngine;
+using Object = UnityEngine.Object;
 using System.Diagnostics;
-using EmuVR.InputManager;
 using MelonLoader;
 using WIGU;
+using System.Linq;
+using UnityEngine.Rendering;
 
-[assembly: MelonInfo(typeof(WIGUx.Modules.WindowCaptureModule.CaptureCore), "Window Capture Mod", "1.0.0", "Earth🐾")]
+
+[assembly: MelonInfo(typeof(WIGUx.Modules.WindowCaptureModule.CaptureCore), "Window Capture Mod", "1.4.0", "Earth🐾")]
 [assembly: MelonGame("EmuVR", "EmuVR")]
 [assembly: HarmonyDontPatchAll] // We will patch manually. 
 
 namespace WIGUx.Modules.WindowCaptureModule
 {
     /// <summary>
-    /// Manages the P/Invoke and texture creation for a SINGLE window capture instance.
-    /// This component is added and removed dynamically by the WindowCaptureHook.
+    /// Manages the window capture process for a single game system OR a test screen.
     /// </summary>
     public class WindowCaptureInstance : MonoBehaviour
     {
+        // --- Shared Memory and Capture fields ---
+        private MemoryMappedFile memoryFile;
+        private MemoryMappedViewAccessor accessor;
+
+        // --- EmuVR component fields (for game capture only) ---
         private GameSystem gameSystem;
         private ScreenController screenController;
         private ScreenReceiver screenReceiver;
         private Retroarch retroarch;
-        private Texture originalEmissionTexture;
-        private Color originalEmissionColor;
+        private BoxCollider screenCollider;
 
-        private IntPtr windowHandle = IntPtr.Zero;
+        // --- Texture and Process Management ---
         private Texture2D windowTexture;
         private Coroutine captureCoroutine;
-        private RenderTexture flippedTexture;
-        public Process gameProcess;
+        private Process gameProcess;
+        private Process captureProcess;
         private bool isCleaningUp = false;
-        private bool hasGameInitially = false; // New flag to track initial state
+        private bool hasGameInitially = false;
+        public bool isTestScreen = false;
         public string batPath;
+        
+        // --- Touchscreen Integration ---
         public string windowIdentifier;
+        public float touchOffsetX = 0.0330f; // Adjustable offset for fingertip alignment
+        public float touchOffsetY = -0.0070f; // Adjustable offset for fingertip alignment
+        public float touchOffsetXLeft = -0.0370f; // Adjustable offset for fingertip alignment
+        public float touchOffsetYLeft = -0.0110f;
+        public string gridConfiguration;
+        private IntPtr sharedTextureHandle = IntPtr.Zero; 
+
+        // --- Multitouch State Management ---
+        // _persistentContacts is the source of truth for what the OS thinks is down.
+        private Dictionary<uint, WinTouch.POINTER_TOUCH_INFO> _persistentContacts = new Dictionary<uint, WinTouch.POINTER_TOUCH_INFO>();
+        // activeFrameContacts is a temporary dictionary to gather events from a single physics frame.
+        private Dictionary<uint, WinTouch.POINTER_TOUCH_INFO> _activeFrameContacts = new Dictionary<uint, WinTouch.POINTER_TOUCH_INFO>();
+        private uint nextTouchId = 0;
+        private HashSet<uint> touchesToRemove = new HashSet<uint>();
+
+        // --- Definitive Light Color Fix ---
+        private RenderTexture lightColorTexture;
+        private AsyncGPUReadbackRequest lightColorRequest;
+        private bool isLightColorRequestInFlight = false;
+
+        // --- Reflection Cache ---
+        private FieldInfo lightScaleField;
+        private FieldInfo screenAspectRatioField;
+        private FieldInfo overscanField;
+
+        // --- Thread-safe data transfer from coroutine to Update() ---
+        private volatile bool newFrameDataAvailable = false;
+        private uint nextWidth, nextHeight;
+
+        // --- P/Invoke for our native RenderPlugin.dll ---
+        private const string PluginName = "RenderPlugin";
+
+        [DllImport(PluginName)]
+        private static extern IntPtr GetRenderEventFunc();
+
+        [DllImport(PluginName)]
+        private static extern void SetSharedHandle(IntPtr handle);
+
+        [DllImport(PluginName)]
+        private static extern void SetTextureFromUnity(IntPtr texturePtr);
+
+        [DllImport(PluginName)]
+        private static extern void SetLogFunction(IntPtr fp);
+
+        delegate void DebugLogDelegate(string s);
+
+        // --- P/Invoke for Window Rect ---
+        [StructLayout(LayoutKind.Sequential)]
+        public struct RECT { public int Left, Top, Right, Bottom; }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+        [DllImport("dwmapi.dll")]
+        static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out RECT pvAttribute, int cbAttribute);
+
+        // DWMWA_EXTENDED_FRAME_BOUNDS gets the window rect in physical pixels, ignoring DPI scaling.
+        const int DWMWA_EXTENDED_FRAME_BOUNDS = 9;
+
+        private IntPtr capturedHwnd = IntPtr.Zero;
 
         void Awake()
         {
-            gameSystem = GetComponent<GameSystem>();
-            if (gameSystem == null)
-            {
-                CaptureCore.Logger.Error("[CaptureCore] Could not find GameSystem component. Self-destructing.");
-                Destroy(this);
-                return;
-            }
-            // GameSystem can have an embedded screen or be connected to an external one.
-            // We need to get the correct ScreenController instance.
-            if (gameSystem.IsUsingEmbeddedScreen)
-                screenController = GetComponent<ScreenController>();
-            else if (gameSystem.Screen != null)
-                screenController = gameSystem.Screen.GetComponent<ScreenController>();
+            InitializePluginLogging();
 
+            // This logic is common to both modes if a screen exists.
             if (screenController != null)
             {
                 screenReceiver = screenController.GetComponent<ScreenReceiver>();
+                var childColliders = screenController.GetComponentsInChildren<BoxCollider>();
+                screenCollider = childColliders.FirstOrDefault(c => c.GetComponent<MeshRenderer>() != null);
+                if (screenCollider == null && childColliders.Length > 0)
+                    screenCollider = childColliders[0];
+            }
+            
+            lightColorTexture = new RenderTexture(1, 1, 0, RenderTextureFormat.ARGB32);
+
+            if (screenController != null)
+            {
+                lightScaleField = typeof(ScreenController).GetField("lightScale", BindingFlags.NonPublic | BindingFlags.Instance);
+                screenAspectRatioField = typeof(ScreenController).GetField("screenAspectRatio", BindingFlags.NonPublic | BindingFlags.Instance);
+                overscanField = typeof(ScreenController).GetField("overscan", BindingFlags.NonPublic | BindingFlags.Instance);
             }
 
-            retroarch = GetComponent<Retroarch>();
             CaptureCore.Logger.Msg($"[CaptureCore] Instance created for {gameObject.name}.");
+        }
+
+        public void InitializeForTestScreen()
+        {
+            isTestScreen = true;
+            // Test Screen: Only needs a collider and a basic material.
+            screenCollider = GetComponent<BoxCollider>();
+            CaptureCore.Logger.Msg($"[CaptureCore] Test screen instance prepared for {gameObject.name}.");
+
+        }
+
+        private void InitializePluginLogging()
+        {
+            DebugLogDelegate logDelegate = (s) => { CaptureCore.Logger.Msg(s); };
+            IntPtr pLogDelegate = Marshal.GetFunctionPointerForDelegate(logDelegate);
+            SetLogFunction(pLogDelegate);
+            GCHandle.Alloc(logDelegate);
         }
 
         void Start()
         {
-            TakeOverScreens();
-            if (screenController != null)
+            if (isTestScreen)
             {
-                // Tell the screen controller that we are providing a texture.
-                // This prevents it from trying to show the "TV noise" or "off" texture.
-                screenController.receivingTexture = true;
+                // Test Screen Initialization
+                var renderer = GetComponent<Renderer>();
+                if (renderer.material == null)
+                {
+                    CaptureCore.Logger.Error("[CaptureCore] Test screen renderer has no material. Cannot proceed.");
+                    Destroy(this);
+                }
+                InitializeTouch();
+                captureCoroutine = StartCoroutine(LaunchDesktopCaptureLoop());
             }
-            captureCoroutine = StartCoroutine(LaunchAndCapture());
+            else
+            {
+                // Game Capture Initialization
+                gameSystem = GetComponent<GameSystem>();
+                if (gameSystem == null)
+                {
+                    CaptureCore.Logger.Error("[CaptureCore] Could not find GameSystem component. Self-destructing.");
+                    Destroy(this);
+                    return;
+                }
+
+                if (gameSystem.IsUsingEmbeddedScreen)
+                    screenController = GetComponent<ScreenController>();
+                else if (gameSystem.Screen != null)
+                    screenController = gameSystem.Screen.GetComponent<ScreenController>();
+
+                retroarch = GetComponent<Retroarch>();
+
+                InitializeTouch();
+
+                TakeOverScreen();
+                captureCoroutine = StartCoroutine(LaunchAndCaptureLoop());
+            }
         }
 
         void Update()
         {
-            if (isCleaningUp) return; // Prevent any logic from running while cleaning up.
+            if (isCleaningUp) return;
 
-            if (!hasGameInitially && gameSystem.Game != null)
+            if (!isTestScreen && isLightColorRequestInFlight && lightColorRequest.done)
             {
-                hasGameInitially = true;
+                if (!lightColorRequest.hasError && screenController != null)
+                {
+                    Color averageColor = lightColorRequest.GetData<Color32>()[0];
+                    screenController.LightColor = averageColor;
+                    float lightScale = (float)lightScaleField.GetValue(screenController);
+                    screenController.LightIntensity = averageColor.grayscale * lightScale;
+                }
+                isLightColorRequestInFlight = false;
             }
 
-            // If we started with a game and now we don't, it means the cartridge was ejected.
-            // This prevents the component from destroying itself during initialization.
-            if (hasGameInitially && gameSystem.Game == null)
+            if (!isTestScreen && gameSystem != null)
             {
-                CaptureCore.Logger.Msg($"[CaptureCore] Game medium ejected from {gameObject.name}. Starting cleanup.");
-                StartCleanup();
-                return; // Exit early to prevent other checks
+                if (gameSystem.Screen != null && screenController?.gameObject != gameSystem.Screen)
+                {
+                    if (screenController != null) screenController.EnableOffTexture();
+                    screenController = gameSystem.Screen.GetComponent<ScreenController>();
+                    if (screenController != null)
+                    {
+                        screenReceiver = screenController.GetComponent<ScreenReceiver>();
+                        screenCollider = screenController.GetComponent<BoxCollider>();
+                        TakeOverScreen();
+                        if (windowTexture != null)
+                        {
+                            ApplyTextureToScreens(windowTexture);
+                            UpdateScreenParameters(nextWidth, nextHeight);
+                        }
+                    }
+                }
+                else if (gameSystem.Screen == null && screenController != null)
+                {
+                    screenController.EnableOffTexture();
+                    screenController = null;
+                    screenReceiver = null;
+                }
+
+                if (!hasGameInitially && gameSystem.Game != null) hasGameInitially = true;
+
+                if (hasGameInitially && gameSystem.Game == null)
+                {
+                    CaptureCore.Logger.Msg($"[CaptureCore] Game medium ejected from {gameObject.name}. Starting cleanup.");
+                    StartCleanup();
+                    return; 
+                }
+
+                if (hasGameInitially && !gameSystem.retroarchIsRunning && !isCleaningUp)
+                {
+                    CaptureCore.Logger.Msg($"[CaptureCore] GameSystem for {gameObject.name} has been powered off. Starting cleanup.");
+                    StartCleanup();
+                }
             }
 
-            // If the GameSystem's retroarch state is false, but we are still running, it means the system was powered off.
-            if (!gameSystem.retroarchIsRunning && captureCoroutine != null)
+            if (newFrameDataAvailable)
             {
-                CaptureCore.Logger.Msg($"[CaptureCore] GameSystem for {gameObject.name} has been powered off. Starting cleanup.");
-                StartCleanup();
+                newFrameDataAvailable = false;
+                ProcessFrame();
+            }
+
+            float adjustmentAmount = 0.001f;
+            bool modifier = Input.GetKey(KeyCode.RightShift);
+
+            if (modifier && Input.GetKeyDown(KeyCode.UpArrow))
+            {
+                touchOffsetY += adjustmentAmount;
+                CaptureCore.Logger.Msg($"[CaptureCore] Touch Offset Updated: X={touchOffsetX:F4}, Y={touchOffsetY:F4}");
+            }
+            if (modifier && Input.GetKeyDown(KeyCode.DownArrow))
+            {
+                touchOffsetY -= adjustmentAmount;
+                CaptureCore.Logger.Msg($"[CaptureCore] Touch Offset Updated: X={touchOffsetX:F4}, Y={touchOffsetY:F4}");
+            }
+            if (modifier && Input.GetKeyDown(KeyCode.RightArrow))
+            {
+                touchOffsetX += adjustmentAmount;
+                CaptureCore.Logger.Msg($"[CaptureCore] Touch Offset Updated: X={touchOffsetX:F4}, Y={touchOffsetY:F4}");
+            }
+            if (modifier && Input.GetKeyDown(KeyCode.LeftArrow))
+            {
+                touchOffsetX -= adjustmentAmount;
+                CaptureCore.Logger.Msg($"[CaptureCore] Touch Offset Updated: X={touchOffsetX:F4}, Y={touchOffsetY:F4}");
+            }
+            if (modifier && Input.GetKeyDown(KeyCode.PageUp))
+            {
+                touchOffsetX = 0f;
+                touchOffsetY = 0f;
+                CaptureCore.Logger.Msg($"[CaptureCore] Touch Offset Reset.");
+            }
+            if (modifier && Input.GetKeyDown(KeyCode.PageDown))
+            {
+                CaptureCore.Logger.Msg($"[CaptureCore] Current Touch Offset: X={touchOffsetX:F4}, Y={touchOffsetY:F4}");
+            }
+
+            // --- Real-time Touch Offset Adjustment for Left Hand (Left Shift) ---
+            bool leftModifier = Input.GetKey(KeyCode.RightControl);
+            if (leftModifier && Input.GetKeyDown(KeyCode.UpArrow))
+            {
+                touchOffsetYLeft += adjustmentAmount;
+                CaptureCore.Logger.Msg($"[CaptureCore] Left Touch Offset Updated: X={touchOffsetXLeft:F4}, Y={touchOffsetYLeft:F4}");
+            }
+            if (leftModifier && Input.GetKeyDown(KeyCode.DownArrow))
+            {
+                touchOffsetYLeft -= adjustmentAmount;
+                CaptureCore.Logger.Msg($"[CaptureCore] Left Touch Offset Updated: X={touchOffsetXLeft:F4}, Y={touchOffsetYLeft:F4}");
+            }
+            if (leftModifier && Input.GetKeyDown(KeyCode.RightArrow))
+            {
+                touchOffsetXLeft += adjustmentAmount;
+                CaptureCore.Logger.Msg($"[CaptureCore] Left Touch Offset Updated: X={touchOffsetXLeft:F4}, Y={touchOffsetYLeft:F4}");
+            }
+            if (leftModifier && Input.GetKeyDown(KeyCode.LeftArrow))
+            {
+                touchOffsetXLeft -= adjustmentAmount;
+                CaptureCore.Logger.Msg($"[CaptureCore] Left Touch Offset Updated: X={touchOffsetXLeft:F4}, Y={touchOffsetYLeft:F4}");
             }
         }
 
-        private void TakeOverScreens()
+        void FixedUpdate()
         {
-            if (screenController == null || screenController.screenMaterial == null)
-            {
-                CaptureCore.Logger.Warning($"[CaptureCore] No screens found on {gameObject.name} to display capture.");
-                return;
-            }
+            // Inject touch points in FixedUpdate to ensure it runs after all physics events (OnCollision, etc.)
+            InjectAllTouchPoints();
+        }
 
-            // Store the original texture and color from the ScreenController's material.
-            originalEmissionTexture = screenController.screenMaterial.GetTexture("_EmissionMap");
-            originalEmissionColor = screenController.screenMaterial.GetColor("_EmissionColor");
+        private void TakeOverScreen()
+        {
+            if (screenController == null) return;
+            screenController.receivingTexture = true;
+            screenController.NetworktvOn = true;
         }
 
         private void ApplyTextureToScreens(Texture texture)
         {
-            if (screenController == null || screenController.screenMaterial == null) return;
-
-            // We now directly modify the material instance that ScreenController owns.
-            // This preserves the connection for other game systems like Retroarch.
-            screenController.screenMaterial.SetTexture("_EmissionMap", texture);
-            screenController.screenMaterial.SetColor("_EmissionColor", Color.white);
-            screenController.screenMaterial.EnableKeyword("_EMISSION");
-
-            // The screen shader uses a custom "_ScreenStretch" property for scaling.
-            // Setting it to a value slightly larger than 1 (like the game's overscan)
-            // ensures the texture stretches to fill the entire screen area.
-            screenController.screenMaterial.SetVector("_ScreenStretch", new Vector2(1.02f, 1.02f));
+            if (isTestScreen)
+            {
+                GetComponent<Renderer>().material.mainTexture = texture;
+            }
+            else if (screenController != null && screenController.screenMaterial != null)
+            {
+                screenController.screenMaterial.SetTexture("_EmissionMap", texture);
+            }
         }
 
         void OnDestroy()
         {
-            // The primary cleanup is now handled by CleanupAndDestroy().
-            // OnDestroy is now just a final safety net.
             if (!isCleaningUp)
             {
-                // This might be called if the GameObject is destroyed unexpectedly.
-                // We should still try to clean up the process.
-                KillGameProcess();
+                StartCleanup();
             }
         }
 
-        private void KillGameProcess()
+        private void KillChildProcesses()
         {
-            // Ensure the game system knows the game is no longer running.
-            if (retroarch != null)
+            if (!isTestScreen && gameSystem != null)
             {
-                // If we were the controlled system, clear it.
-                if (GameSystem.ControlledSystem == gameSystem && gameSystem != null)
+                if (retroarch != null) 
                 {
-                    CaptureCore.Logger.Msg("[CaptureCore] Clearing controlled system.");
-                    GameSystem.ControlledSystem = null;
+                    if (GameSystem.ControlledSystem == gameSystem) GameSystem.ControlledSystem = null;
+                    retroarch.isRunning = false;
                 }
-
-                retroarch.isRunning = false;
+                if (gameSystem.isServer && gameSystem.retroarchIsRunning)
+                    gameSystem.NetworkretroarchIsRunning = false;
             }
-            if (gameSystem != null && gameSystem.isServer && gameSystem.retroarchIsRunning)
+
+            try
             {
-                gameSystem.NetworkretroarchIsRunning = false;
+                if (captureProcess != null && !captureProcess.HasExited)
+                {
+                    CaptureCore.Logger.Msg($"[CaptureCore] Closing capture process {captureProcess.ProcessName}.");
+                    captureProcess.CloseMainWindow();
+                    captureProcess.Kill();
+                }
             }
+            catch (Exception e) { CaptureCore.Logger.Warning($"[CaptureCore] Could not close capture process: {e.Message}"); }
 
-            // Close the game process we launched
             try
             {
                 if (gameProcess != null && !gameProcess.HasExited)
                 {
                     CaptureCore.Logger.Msg($"[CaptureCore] Closing process {gameProcess.ProcessName}.");
-                    gameProcess.CloseMainWindow();
                     gameProcess.Kill();
                 }
             }
-            catch (Exception e)
-            {
-                CaptureCore.Logger.Warning($"[CaptureCore] Could not close game process: {e.Message}");
-            }
+            catch (Exception e) { CaptureCore.Logger.Warning($"[CaptureCore] Could not close game process: {e.Message}"); }
         }
 
         private void StartCleanup()
@@ -189,287 +392,590 @@ namespace WIGUx.Modules.WindowCaptureModule
         private IEnumerator CleanupAndDestroy()
         {
             CaptureCore.Logger.Msg($"[CaptureCore] Running cleanup for {gameObject.name}.");
-            KillGameProcess();
-            // Restore the original texture and color to the ScreenController's material.
-            if (screenController != null)
-            {
-                // This is the game's built-in, reliable way to reset the screen.
-                screenController.EnableOffTexture();
-            }
+            KillChildProcesses();
 
-            yield return null; // Wait a frame to ensure state changes propagate.
+            if (screenController != null) screenController.EnableOffTexture();
 
-            if (windowTexture != null)
-            {
-                Destroy(windowTexture);
-            }
-            if (flippedTexture != null)
-            {
-                RenderTexture.ReleaseTemporary(flippedTexture);
-                flippedTexture = null;
-            }
+            yield return null;
+
+            accessor?.Dispose();
+            memoryFile?.Dispose();
+
+            if (lightColorTexture != null) Destroy(lightColorTexture);
 
             Destroy(this);
         }
-        #region Window Capture
-        private IEnumerator LaunchAndCapture()
+
+        private IEnumerator ConnectToSharedMemory(string sharedMemoryName)
         {
-            // 2. Launch the game using the .bat file
+            accessor?.Dispose();
+            memoryFile?.Dispose(); 
+            accessor = null;
+            memoryFile = null;
+
+            CaptureCore.Logger.Msg($"[CaptureCore] Attempting to connect to Shared Memory: '{sharedMemoryName}'");
+
+            yield return new WaitUntil(() => {
+                if (captureProcess == null || captureProcess.HasExited) return true;
+                if (isCleaningUp) return true;
+                try
+                {
+                    memoryFile = MemoryMappedFile.OpenExisting(sharedMemoryName, MemoryMappedFileRights.ReadWrite); 
+                    return true;
+                }
+                catch (FileNotFoundException) { return false; }
+                catch (Exception e)
+                {
+                    CaptureCore.Logger.Error($"[CaptureCore] Error trying to open memory file: {e.Message}");
+                    return true;
+                }
+            });
+
+            if (memoryFile != null)
+            {
+                CaptureCore.Logger.Msg($"[CaptureCore] Successfully connected to Shared Memory '{sharedMemoryName}'.");
+                accessor = memoryFile.CreateViewAccessor(0, 24, MemoryMappedFileAccess.Read); // W+H+Handle+HWND
+            }
+            else
+            {
+                if (!isCleaningUp) CaptureCore.Logger.Error($"[CaptureCore] Failed to connect to Shared Memory '{sharedMemoryName}'. Capture process might have failed to start.");
+            }
+        }
+
+        private IEnumerator LaunchDesktopCaptureLoop()
+        {
+            string sharedMemoryName = "EmuVR_DesktopCapture_SHM";
             try
             {
-                string fullBatPath = Path.GetFullPath(batPath);
-                string gameDirectory = Path.GetDirectoryName(fullBatPath);
-                CaptureCore.Logger.Msg($"[CaptureCore] Executing: {fullBatPath}");
-                ProcessStartInfo startInfo = new ProcessStartInfo(fullBatPath)
+                string userDataPath = Path.Combine(Directory.GetParent(Application.dataPath).FullName, "UserData");
+                string captureExePath = Path.Combine(userDataPath, "WindowCapture", "GraphicsCapture.exe");
+                string launchArguments = $"--desktop --memname \"{sharedMemoryName}\"";
+
+                CaptureCore.Logger.Msg($"[CaptureCore] Launching desktop capture: {captureExePath}");
+                CaptureCore.Logger.Msg($"[CaptureCore] With arguments: {launchArguments}");
+
+                captureProcess = Process.Start(new ProcessStartInfo(captureExePath, launchArguments)
                 {
-                    WorkingDirectory = gameDirectory,
-                    UseShellExecute = true // UseShellExecute is often better for .bat files
-                };
-                Process.Start(startInfo); // Launch the batch file, but don't store this cmd process.
+                    WorkingDirectory = Path.GetDirectoryName(captureExePath),
+                    UseShellExecute = true
+                });
+
+                if (captureProcess != null) CaptureCore.RegisterCaptureProcess(captureProcess);
             }
             catch (Exception e)
             {
-                CaptureCore.Logger.Error($"[CaptureCore] Failed to launch .bat file: {e.Message}");
-                Destroy(this);
+                CaptureCore.Logger.Error($"[CaptureCore] Failed to launch GraphicsCapture.exe for desktop: {e.Message}");
+                StartCleanup();
                 yield break;
             }
 
-            // Give the actual game a moment to start up after the batch file runs.
-            // This helps prevent us from capturing the cmd window by mistake.
-            for (int i = 0; i < 4; i++)
+            while (this != null && !this.gameObject.Equals(null))
             {
-                yield return new WaitForSeconds(0.25f);
+                if (isCleaningUp) yield break;
+                if (accessor == null)
+                {
+                    yield return StartCoroutine(ConnectToSharedMemory(sharedMemoryName));
+                    if (accessor == null) continue;
+                }
+                CaptureAndApply();
+                yield return null;
             }
-
-            // 3. Find the window using the identifier from the .win file
-            CaptureCore.Logger.Msg($"[CaptureCore] Searching for process/window with identifier: '{windowIdentifier}'");
-
-            // 4. Main capture loop
-            while (this != null && !this.gameObject.Equals(null)) // Loop as long as this component exists
-            {
-                // If we don't have a window handle, try to find one.
-                if (windowHandle == IntPtr.Zero || !IsWindow(windowHandle))
-                {
-                    if (windowHandle != IntPtr.Zero)
-                    {
-                        CaptureCore.Logger.Msg("[CaptureCore] Window handle became invalid. Searching for a new one...");
-                        windowHandle = IntPtr.Zero;
-                    }
-
-                    // Method 1: Search by Process Name (more reliable)
-                    string processName = windowIdentifier;
-                    if (processName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
-                    {
-                        processName = Path.GetFileNameWithoutExtension(processName);
-                    }
-
-                    Process[] processes = Process.GetProcessesByName(processName);
-                    if (processes.Length > 0)
-                    {
-                        // Find the first process that isn't cmd.exe and has a window.
-                        gameProcess = Array.Find(processes, p => p.ProcessName != "cmd" && p.MainWindowHandle != IntPtr.Zero);
-
-                        if (gameProcess != null)
-                        {
-                            windowHandle = gameProcess.MainWindowHandle;
-                            CaptureCore.Logger.Msg($"[CaptureCore] Found process '{processName}' by name. Handle: {windowHandle}");
-                        }
-                    }
-
-                    // Method 2: Search by Window Title (fallback)
-                    if (windowHandle == IntPtr.Zero)
-                    {
-                        windowHandle = FindWindow(null, windowIdentifier);
-                    }
-
-                    if (windowHandle != IntPtr.Zero)
-                    {
-                         CaptureCore.Logger.Msg($"[CaptureCore] Acquired window handle: {windowHandle}. Resuming capture.");
-                    }
-                }
-
-                // If we have a valid handle, capture it.
-                if (windowHandle != IntPtr.Zero && IsWindow(windowHandle))
-                {
-                    CaptureAndBlit(windowHandle);
-                }
-
-                // If the underlying process has exited, we should stop trying.
-                if (gameProcess != null && gameProcess.HasExited)
-                {
-                    CaptureCore.Logger.Msg("[CaptureCore] Target process has exited. Stopping capture loop.");
-                    break; // Exit the while loop
-                }
-
-                yield return null; // Capture at game's framerate (as fast as possible)
-            }
-
-            // If the loop breaks, it means the window was closed.
-            // Destroy this component, which will trigger OnDestroy() for full cleanup.
             StartCleanup();
         }
 
-        private void CaptureAndBlit(IntPtr handle)
+        private IEnumerator LaunchAndCaptureLoop()
         {
-            if (!GetClientRect(handle, out RECT clientRect)) return;
+            bool useHook = false;
+            string sharedMemoryName;
 
-            int width = clientRect.Right - clientRect.Left;
-            int height = clientRect.Bottom - clientRect.Top;
-
-            if (width <= 0 || height <= 0) return;
-
-            if (windowTexture == null || windowTexture.width != width || windowTexture.height != height)
+            try
             {
-                if (windowTexture != null) Destroy(windowTexture);
-                // Create the source texture as LINEAR (linear=true). This "tricks" Unity into not
-                // applying its own gamma correction, allowing the screen shader to do it.
-                windowTexture = new Texture2D(width, height, TextureFormat.BGRA32, false, true);
+                string userDataPath = Path.Combine(Directory.GetParent(Application.dataPath).FullName, "UserData");
+                string captureExePath = Path.Combine(userDataPath, "WindowCapture", "GraphicsCapture.exe");
 
-                if (flippedTexture != null) RenderTexture.ReleaseTemporary(flippedTexture);
-                // The destination texture must also be LINEAR to prevent conversion during the blit.
-                flippedTexture = RenderTexture.GetTemporary(width, height, 0, RenderTextureFormat.Default, RenderTextureReadWrite.Linear);
-                flippedTexture.filterMode = FilterMode.Bilinear;
-                // Apply the final render texture to the screens. This only needs to be done
-                // when the texture is resized.
-                ApplyTextureToScreens(flippedTexture);
+                string[] winFileLines = windowIdentifier.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                string processName = winFileLines.Length > 0 ? winFileLines[0].Trim() : windowIdentifier.Trim();
+                useHook = winFileLines.Length > 1 && winFileLines[1].Trim().ToUpper() == "HOOK";
+
+                sharedMemoryName = $"{Path.GetFileNameWithoutExtension(processName)}_{gameSystem.GetInstanceID()}_SHM";
+                string launchArguments = $"--target \"{processName}\" --memname \"{sharedMemoryName}\"";
+
+                if (useHook) launchArguments += " --hook";
+
+                CaptureCore.Logger.Msg($"[CaptureCore] Launching capture program: {captureExePath}");
+                CaptureCore.Logger.Msg($"[CaptureCore] With arguments: {launchArguments}");
+
+                captureProcess = Process.Start(new ProcessStartInfo(captureExePath, launchArguments)
+                {
+                    WorkingDirectory = Path.GetDirectoryName(captureExePath),
+                    UseShellExecute = true
+                });
+
+                if (captureProcess != null) CaptureCore.RegisterCaptureProcess(captureProcess);
+            }
+            catch (Exception e)
+            {
+                CaptureCore.Logger.Error($"[CaptureCore] Failed to launch GraphicsCapture.exe: {e.Message}");
+                StartCleanup();
+                yield break;
             }
 
-            IntPtr hdcSrc = GetDC(handle); // Use GetDC for the client area
-            IntPtr hdcDest = CreateCompatibleDC(hdcSrc);
-            IntPtr hBitmap = CreateCompatibleBitmap(hdcSrc, width, height);
-            IntPtr hOld = SelectObject(hdcDest, hBitmap);
+            if (!useHook)
+            {
+                try
+                {
+                    CaptureCore.Logger.Msg($"[CaptureCore] Executing game launcher: {batPath}");
+                    Process.Start(new ProcessStartInfo(batPath)
+                    {
+                        WorkingDirectory = Path.GetDirectoryName(batPath),
+                        UseShellExecute = true
+                    });
+                }
+                catch (Exception e)
+                {
+                    CaptureCore.Logger.Error($"[CaptureCore] Failed to launch game via .bat file: {e.Message}");
+                    StartCleanup();
+                    yield break;
+                }
+            }
 
-            // You can try swapping between BitBlt and PrintWindow.
-            // PrintWindow can sometimes be faster or capture windows that BitBlt cannot.
-            // The '2' flag (PW_RENDERFULLCONTENT) is undocumented but often needed for DirectX/OpenGL windows. It's worth testing both.
-            //PrintWindow(handle, hdcDest, 2);
-            // Using CAPTUREBLT can sometimes reduce latency by bypassing DWM composition.
-            BitBlt(hdcDest, 0, 0, width, height, hdcSrc, 0, 0, SRCCOPY | CAPTUREBLT);
-            SelectObject(hdcDest, hOld);
-            ReleaseDC(handle, hdcSrc);
+            string[] winFileLinesForName = windowIdentifier.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            string gameProcessName = Path.GetFileNameWithoutExtension(winFileLinesForName.Length > 0 ? winFileLinesForName[0].Trim() : windowIdentifier.Trim());
+            gameProcess = null;
+            CaptureCore.Logger.Msg($"[CaptureCore] Searching for game process: '{gameProcessName}'...");
 
-            BITMAPINFO bmi = new BITMAPINFO();
-            bmi.biSize = 40;
-            bmi.biWidth = width;
-            bmi.biHeight = -height; // Negative height to get a top-down DIB
-            bmi.biPlanes = 1;
-            bmi.biBitCount = 32;
-            bmi.biCompression = 0; // BI_RGB
+            for (int i = 0; i < 30; i++)
+            {
+                var processes = Process.GetProcessesByName(gameProcessName);
+                if (processes.Length > 0)
+                {
+                    gameProcess = processes[0];
+                    CaptureCore.Logger.Msg($"[CaptureCore] Found game process with ID: {gameProcess.Id}");
+                    break;
+                }
+                yield return new WaitForSeconds(0.5f);
+            }
 
-            byte[] bmpBytes = new byte[width * height * 4];
-            GetDIBits(hdcDest, hBitmap, 0, (uint)height, bmpBytes, ref bmi, 0);
+            if (gameProcess == null)
+            {
+                CaptureCore.Logger.Error($"[CaptureCore] Timed out waiting for game process '{gameProcessName}' to start. Aborting.");
+                StartCleanup();
+                yield break;
+            }
 
-            DeleteDC(hdcDest);
-            DeleteObject(hBitmap);
+            while (this != null && !this.gameObject.Equals(null))
+            {
+                if (isCleaningUp) yield break;
+                if (accessor == null)
+                {
+                    yield return StartCoroutine(ConnectToSharedMemory(sharedMemoryName));
+                    if (accessor == null)
+                    {
+                        if (gameProcess == null || gameProcess.HasExited)
+                        {
+                            CaptureCore.Logger.Msg("[CaptureCore] Game process has exited while trying to connect to memory. Aborting.");
+                            break;
+                        }
+                        CaptureCore.Logger.Warning($"[CaptureCore] Failed to connect to shared memory. Retrying...");
+                        yield return new WaitForSeconds(1.0f);
+                        continue;
+                    }
+                }
 
-            windowTexture.LoadRawTextureData(bmpBytes);
-            windowTexture.Apply();
+                CaptureAndApply();
 
-            // Flip the texture vertically using a blit.
-            Graphics.Blit(windowTexture, flippedTexture, new Vector2(1, -1), new Vector2(0, 1));
+                if (gameProcess != null && !isCleaningUp && gameProcess.HasExited)
+                {
+                    CaptureCore.Logger.Msg("[CaptureCore] Target process has exited. Stopping capture loop.");
+                    break;
+                }
+                yield return null;
+            }
+            StartCleanup();
         }
 
-        #endregion
-
-        #region P/Invoke Win32 API
-        [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
-        const int SRCCOPY = 0x00CC0020;
-        const int CAPTUREBLT = 0x40000000;
-        [DllImport("gdi32.dll")] private static extern bool BitBlt(IntPtr hObject, int nXDest, int nYDest, int nWidth, int nHeight, IntPtr hObjectSource, int nXSrc, int nYSrc, int dwRop);
-        [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
-        [DllImport("user32.dll")] private static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
-        [DllImport("user32.dll", SetLastError = true)] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
-        [DllImport("user32.dll")] private static extern bool IsWindow(IntPtr hWnd);
-        [DllImport("user32.dll")] private static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
-        [DllImport("user32.dll")] private static extern IntPtr GetDC(IntPtr hWnd); // Changed from GetWindowDC
-        [DllImport("user32.dll")] private static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
-        [DllImport("gdi32.dll")] private static extern IntPtr CreateCompatibleBitmap(IntPtr hdc, int nWidth, int nHeight);
-        [DllImport("gdi32.dll")] private static extern IntPtr CreateCompatibleDC(IntPtr hdc);
-        [DllImport("gdi32.dll")] private static extern bool DeleteDC(IntPtr hdc);
-        [DllImport("gdi32.dll")] private static extern bool DeleteObject(IntPtr hObject);
-        [DllImport("gdi32.dll")] private static extern IntPtr SelectObject(IntPtr hdc, IntPtr hgdiobj);
-        [DllImport("gdi32.dll")] private static extern int GetDIBits(IntPtr hdc, IntPtr hbmp, uint uStartScan, uint cScanLines, [Out] byte[] lpvBits, ref BITMAPINFO lpbi, uint uUsage);
-
-        [StructLayout(LayoutKind.Sequential)]
-        public struct BITMAPINFO
+        private void CaptureAndApply()
         {
-            public uint biSize;
-            public int biWidth, biHeight;
-            public ushort biPlanes, biBitCount;
-            public uint biCompression, biSizeImage;
-            public int biXPelsPerMeter, biYPelsPerMeter;
-            public uint biClrUsed, biClrImportant;
+            if (accessor == null) return;
+            uint width = 0, height = 0;
+            IntPtr newHandle = IntPtr.Zero, newHwnd = IntPtr.Zero;
+
+            try
+            {
+                width = accessor.ReadUInt32(0);
+                height = accessor.ReadUInt32(4);
+                newHandle = (IntPtr)accessor.ReadInt64(8);
+                newHwnd = (IntPtr)accessor.ReadInt64(16);
+            }
+            catch (Exception e)
+            {
+                CaptureCore.Logger.Warning($"[CaptureCore] Shared memory read failed: {e.Message}");
+                accessor?.Dispose();
+                memoryFile?.Dispose();
+                accessor = null;
+                memoryFile = null;
+                return; 
+            }
+
+            if (newHwnd != IntPtr.Zero && newHwnd != capturedHwnd) capturedHwnd = newHwnd;
+
+            nextWidth = width;
+            nextHeight = height;
+            sharedTextureHandle = newHandle;
+            newFrameDataAvailable = true;
         }
-        #endregion
+
+        private void ProcessFrame()
+        {
+            CheckAndResizeTexture(nextWidth, nextHeight);
+            if (windowTexture == null) return;
+
+            if (!isTestScreen && screenController != null && screenController.tvOn && !isLightColorRequestInFlight)
+            {
+                RenderTexture[] mipRTs = {
+                    RenderTexture.GetTemporary(windowTexture.width / 2, windowTexture.height / 2, 0, RenderTextureFormat.Default),
+                    RenderTexture.GetTemporary(windowTexture.width / 4, windowTexture.height / 4, 0, RenderTextureFormat.Default)
+                };
+                Graphics.Blit(windowTexture, mipRTs[0]);
+                for (int i = 0; i < 5; i++) Graphics.Blit(mipRTs[i % 2], mipRTs[(i + 1) % 2]);
+                Graphics.Blit(mipRTs[0], lightColorTexture);
+                RenderTexture.ReleaseTemporary(mipRTs[0]);
+                RenderTexture.ReleaseTemporary(mipRTs[1]);
+                lightColorRequest = AsyncGPUReadback.Request(lightColorTexture);
+                isLightColorRequestInFlight = true;
+            }
+
+            if (sharedTextureHandle != IntPtr.Zero) SetSharedHandle(sharedTextureHandle);
+            GL.IssuePluginEvent(GetRenderEventFunc(), 1);
+        }
+
+        private void CheckAndResizeTexture(uint width, uint height)
+        {
+            if (width <= 0 || height <= 0 || sharedTextureHandle == IntPtr.Zero) return;
+            bool needsRecreation = windowTexture == null || windowTexture.width != width || windowTexture.height != height;
+
+            if (needsRecreation)
+            {
+                CaptureCore.Logger.Msg($"[CaptureCore] Resizing texture to {width}x{height}.");
+                if (windowTexture != null) Destroy(windowTexture);
+                windowTexture = new Texture2D((int)width, (int)height, TextureFormat.BGRA32, false, true);
+                windowTexture.Apply();
+                SetTextureFromUnity(windowTexture.GetNativeTexturePtr());
+                SetSharedHandle(sharedTextureHandle);
+                CaptureCore.Logger.Msg($"[CaptureCore] Passed new texture pointer and shared handle to plugin.");
+                ApplyTextureToScreens(windowTexture);
+                if (!isTestScreen) 
+                {
+                    UpdateScreenParameters(width, height);
+                }
+
+                if (screenController != null && screenController.screenMaterial != null)
+                {
+                    screenController.screenMaterial.mainTextureScale = new Vector2(1, -1);
+                    screenController.screenMaterial.mainTextureOffset = new Vector2(0, 1);
+                } else if (isTestScreen) {
+                    GetComponent<Renderer>().material.mainTextureScale = new Vector2(1, -1);
+                    GetComponent<Renderer>().material.mainTextureOffset = new Vector2(0, 1);
+                }
+            }
+        }
+
+        private void UpdateScreenParameters(uint width, uint height)
+        {
+            if (screenController == null || screenController.screenMaterial == null) return;
+            float screenAspectRatio = (float)screenAspectRatioField.GetValue(screenController);
+            Vector2 overscan = (Vector2)overscanField.GetValue(screenController);
+            float textureAspectRatio = (float)width / height;
+            float aspectMultiplierRatio = textureAspectRatio / screenAspectRatio;
+            Vector2 aspectRatioMultiplier = Vector2.one;
+            if (screenAspectRatio > 0)
+            {
+                aspectRatioMultiplier.x = aspectMultiplierRatio < 1.0f ? 1.0f / aspectMultiplierRatio : 1.0f;
+                aspectRatioMultiplier.y = aspectMultiplierRatio < 1.0f ? 1.0f : aspectMultiplierRatio;
+            }
+            screenController.screenMaterial.SetVector("_ScreenStretch", new Vector4(overscan.x * aspectRatioMultiplier.x, overscan.y * aspectRatioMultiplier.y, 0, 0));
+        }
+
+        private void InitializeTouch()
+        {
+            if (screenCollider == null)
+            {
+                CaptureCore.Logger.Warning("[CaptureCore] Touch requested, but no screen collider found. Touch will be disabled.");
+                return;
+            }
+
+            CaptureCore.Logger.Msg("[CaptureCore] Initializing Touch Injection for this instance.");
+            if (!WinTouch.InitializeTouchInjection(10, WinTouch.TOUCH_FEEDBACK.DEFAULT))
+            {
+                CaptureCore.Logger.Error("[CaptureCore] Failed to initialize touch injection.");
+                return;
+            }
+
+            Physics.autoSyncTransforms = true;
+            
+            // Add a larger trigger collider for hover detection if it doesn't exist
+            BoxCollider hoverCollider = screenCollider.gameObject.GetComponents<BoxCollider>().FirstOrDefault(c => c.isTrigger);
+            if (hoverCollider == null)
+            {
+                hoverCollider = screenCollider.gameObject.AddComponent<BoxCollider>();
+                hoverCollider.isTrigger = true;
+                hoverCollider.size = new Vector3(1.1f, 1.1f, 0.4f); // Larger than the physical collider
+                CaptureCore.Logger.Msg("[CaptureCore] Added hover trigger collider for touch.");
+            }
+
+            // --- NEW: Create separate interaction script for each hand ---
+            var rightHand = PlayerVRSetup.RightHand?.gameObject;
+            if (rightHand != null)
+            {
+                var touchInteraction = rightHand.AddComponent<HandTouchInteraction>();
+                touchInteraction.Initialize(this, screenCollider, hoverCollider, nextTouchId++);
+            }
+            else
+            {
+                CaptureCore.Logger.Error("[TouchscreenInteraction] Could not find Player's Right Hand.");
+            }
+
+            var leftHand = PlayerVRSetup.LeftHand?.gameObject;
+            if (leftHand != null)
+            {
+                var touchInteraction = leftHand.AddComponent<HandTouchInteraction>();
+                touchInteraction.Initialize(this, screenCollider, hoverCollider, nextTouchId++);
+            }
+            else
+            {
+                CaptureCore.Logger.Error("[TouchscreenInteraction] Could not find Player's Left Hand.");
+            }
+        }
+
+        public void UpdateTouchState(uint touchId, Vector3 hitPoint, bool isStartingToDraw, Transform handTransform, bool isHover = false)
+        {
+            string eventType = isStartingToDraw ? "DOWN" : "UPDATE";
+
+            // --- Rotation-Aware Offset Calculation ---
+            float offsetX, offsetY;
+            if (touchId == 0) // Right Hand
+            {
+                offsetX = touchOffsetX;
+                offsetY = touchOffsetY;
+            }
+            else // Left Hand
+            {
+                offsetX = touchOffsetXLeft;
+                offsetY = touchOffsetYLeft;
+            }
+
+            // 1. Create a 3D offset vector in the hand's local space.
+            Vector3 localOffset = new Vector3(offsetX, offsetY, 0);
+            // 2. Transform this local offset into a world-space direction, accounting for hand rotation.
+            Vector3 worldOffset = handTransform.TransformDirection(localOffset);
+            // 3. Apply the world-space offset to the collision point.
+            Vector3 adjustedHitPoint = hitPoint + worldOffset;
+            // 4. Convert the adjusted point to local UV coordinates.
+            Vector3 localHit = screenCollider.transform.InverseTransformPoint(adjustedHitPoint);
+            float u = localHit.x + 0.5f;
+            float v = localHit.y + 0.5f;
+
+            // 3. Calculate the final pixel coordinates from the adjusted UVs.
+            int touchX, touchY;
+            if (isTestScreen)
+            {
+                touchX = (int)(u * CaptureCore.GetSystemMetrics(CaptureCore.SM_CXSCREEN));
+                touchY = (int)((1 - v) * CaptureCore.GetSystemMetrics(CaptureCore.SM_CYSCREEN));
+            }
+            else
+            {
+                RECT windowRect;
+                if (capturedHwnd == IntPtr.Zero || DwmGetWindowAttribute(capturedHwnd, DWMWA_EXTENDED_FRAME_BOUNDS, out windowRect, Marshal.SizeOf(typeof(RECT))) != 0) return;
+                touchX = windowRect.Left + (int)(u * (windowRect.Right - windowRect.Left));
+                touchY = windowRect.Top + (int)((1 - v) * (windowRect.Bottom - windowRect.Top));
+            }
+
+            var contact = new WinTouch.POINTER_TOUCH_INFO();
+            contact.pointerInfo.pointerType = WinTouch.POINTER_INPUT_TYPE.PT_TOUCH;
+            contact.pointerInfo.pointerId = touchId;
+
+            if (isHover)
+            {
+                contact.pointerInfo.pointerFlags = WinTouch.POINTER_FLAGS.INRANGE | WinTouch.POINTER_FLAGS.UPDATE;
+            }
+            else
+            {
+                contact.pointerInfo.pointerFlags = WinTouch.POINTER_FLAGS.INRANGE | WinTouch.POINTER_FLAGS.INCONTACT;
+                if (isStartingToDraw)
+                {
+                    contact.pointerInfo.pointerFlags |= WinTouch.POINTER_FLAGS.DOWN;
+                }
+                else
+                {
+                    contact.pointerInfo.pointerFlags |= WinTouch.POINTER_FLAGS.UPDATE;
+                }
+            }
+
+            contact.pointerInfo.ptPixelLocation.x = touchX;
+            contact.pointerInfo.ptPixelLocation.y = touchY;
+            contact.touchMask = WinTouch.TOUCH_MASK.CONTACTAREA | WinTouch.TOUCH_MASK.ORIENTATION | WinTouch.TOUCH_MASK.PRESSURE;
+            contact.orientation = 90;
+            contact.pressure = 1024;
+            contact.contact.left = touchX - 2; contact.contact.right = touchX + 2;
+            contact.contact.top = touchY - 2; contact.contact.bottom = touchY + 2;
+
+            // Queue the event for this physics frame. It will be processed in FixedUpdate.
+            _activeFrameContacts[touchId] = contact;
+        }
+
+        public void HandleDrawEnd(uint touchId)
+        {
+            // Don't do anything immediately. Just flag this touchId for removal.
+            // The actual UP event will be handled in FixedUpdate.
+            touchesToRemove.Add(touchId);
+        }
+
+        public void HandleHover(uint touchId, Vector3 hitPoint, Transform handTransform)
+        {
+            // A hover is like a draw update, but without the DOWN/INCONTACT flags.
+            // We can reuse the UpdateTouchState logic but force it to be a non-drawing event.
+            UpdateTouchState(touchId, hitPoint, false, handTransform, true);
+        }
+
+
+        private void InjectAllTouchPoints()
+        {
+            // 1. Merge the contacts from the current physics frame into our persistent state.
+            foreach (var frameContact in _activeFrameContacts)
+            {
+                _persistentContacts[frameContact.Key] = frameContact.Value;
+            }
+
+            // 2. If no touches are active or pending removal, do nothing.
+            if (_persistentContacts.Count == 0)
+            {
+                _activeFrameContacts.Clear();
+                touchesToRemove.Clear();
+                return;
+            }
+
+            // 3. Build the injection list from the persistent state.
+            var contactsToInject = new List<WinTouch.POINTER_TOUCH_INFO>();
+
+            foreach (var persistentContact in _persistentContacts)
+            {
+                var contact = persistentContact.Value;
+
+                if (touchesToRemove.Contains(persistentContact.Key))
+                {
+                    // If this touch was flagged for removal, send an UP event.
+                    contact.pointerInfo.pointerFlags = WinTouch.POINTER_FLAGS.UP;
+                }
+                else if ((contact.pointerInfo.pointerFlags & WinTouch.POINTER_FLAGS.INCONTACT) == 0)
+                {
+                    // This is a hover point. It should be INRANGE but not INCONTACT.
+                    // The DOWN flag should also be removed if it was accidentally added.
+                    contact.pointerInfo.pointerFlags &= ~WinTouch.POINTER_FLAGS.INCONTACT;
+                    contact.pointerInfo.pointerFlags &= ~WinTouch.POINTER_FLAGS.DOWN;
+                    contact.pointerInfo.pointerFlags |= WinTouch.POINTER_FLAGS.INRANGE | WinTouch.POINTER_FLAGS.UPDATE;
+                }
+                contactsToInject.Add(contact);
+            }
+
+            // 4. Inject the batch.
+            if (contactsToInject.Count > 0)
+            {
+                WinTouch.InjectTouchInput(contactsToInject.Count, contactsToInject.ToArray());
+            }
+
+            // 5. If we sent an UP event, clean the persistent contacts that were removed.
+            if (touchesToRemove.Count > 0)
+            {
+                foreach (var idToRemove in touchesToRemove)
+                {
+                    _persistentContacts.Remove(idToRemove);
+                }
+            }
+
+            // 6. Always clear the temporary frame data for the next physics step.
+            _activeFrameContacts.Clear();
+            touchesToRemove.Clear();
+        }
     }
-    
-    /// <summary>
-    /// This is now a MelonMod, which is the main entry point for our code.
-    /// It will inject the hooks needed for the capture functionality to work.
-    /// </summary>
+
     public class CaptureCore : MelonMod
     {
         public static MelonLogger.Instance Logger { get; private set; }
         private HarmonyLib.Harmony harmony;
+        
+        [DllImport("user32.dll")]
+        public static extern int GetSystemMetrics(int nIndex);
+
+        public const int SM_CXSCREEN = 0;
+        public const int SM_CYSCREEN = 1;
+
+
+        private GameObject testTouchscreen;
+        private static List<Process> runningCaptureProcesses = new List<Process>();
+
 
         public override void OnInitializeMelon()
         {
             Logger = LoggerInstance;
             harmony = new HarmonyLib.Harmony("com.yourname.windowcapture");
-            
-            // Patch 1: Intercept the game's internal power-on logic.
+
             var internalPowerOriginal = typeof(GameSystemState).GetMethod("InternalPower", BindingFlags.NonPublic | BindingFlags.Instance);
             var internalPowerPrefix = typeof(CaptureCore).GetMethod(nameof(OnInternalPowerPrefix));
             harmony.Patch(internalPowerOriginal, new HarmonyMethod(internalPowerPrefix));
 
-            // Patch 2: Correctly handle re-focusing for our custom systems.
-            var updateOriginal = typeof(GameSystem).GetMethod("Update", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-            var updatePrefix = typeof(CaptureCore).GetMethod(nameof(OnGameSystemUpdatePrefix));
-            harmony.Patch(updateOriginal, new HarmonyMethod(updatePrefix));
-
-            // Patch 3: Prevent Retroarch.Open from launching for our custom games.
             var retroarchOpenOriginal = typeof(Retroarch).GetMethod("Open", BindingFlags.Public | BindingFlags.Instance);
             var retroarchOpenPrefix = typeof(CaptureCore).GetMethod(nameof(OnRetroarchOpenPrefix));
             harmony.Patch(retroarchOpenOriginal, new HarmonyMethod(retroarchOpenPrefix));
         }
-
-        public static bool OnGameSystemUpdatePrefix(GameSystem __instance, LongPressControl ___longPressControl)
+        [System.Obsolete]
+        public override void OnApplicationStart()
         {
-            var captureInstance = __instance.GetComponent<WindowCaptureInstance>();
-            if (captureInstance == null)
-            {
-                return true; // Not our system, run the original Update method.
-            }
-
-            if (___longPressControl.GetLongPress(Button.EngageSystem, LongPressMode.Canceled) && (bool)(UnityEngine.Object)__instance.Screen)
-            {
-                GameSystem.ControlledSystem = __instance;
-
-                var screenController = __instance.Screen.GetComponent<ScreenController>();
-                if (screenController != null && !screenController.tvOn)
-                {
-                    screenController.TVToggle(true);
-                }
-
-                return false; // We've handled the re-focus, so we skip the original Update method for this frame.
-            }
-
-            return true;
+            Physics.autoSyncTransforms = true;
         }
 
+        public override void OnApplicationQuit()
+        {
+            Logger.Msg("[CaptureCore] Application quitting. Terminating all capture processes.");
+            foreach (var process in runningCaptureProcesses)
+            {
+                try
+                {
+                    if (process != null && !process.HasExited)
+                    {
+                        Logger.Msg($"[CaptureCore] Terminating process {process.ProcessName} (ID: {process.Id}).");
+                        process.Kill();
+                    }
+                }
+                catch (Exception e) { Logger.Warning($"[CaptureCore] Failed to kill process on quit: {e.Message}"); }
+            }
+            runningCaptureProcesses.Clear();
+        }
+
+        public override void OnUpdate()
+        {
+            if (Input.GetKeyDown(KeyCode.F2))
+            {
+                if (testTouchscreen == null)
+                {
+                    CreateTestTouchscreen();
+                }
+                else
+                {
+                    Object.Destroy(testTouchscreen);
+                }
+            }
+        }
+        
         public static bool OnRetroarchOpenPrefix(Retroarch __instance)
         {
             var gameSystem = __instance.GetComponent<GameSystem>();
             if (gameSystem != null && gameSystem.GetComponent<WindowCaptureInstance>() != null)
             {
                 Logger.Msg("[CaptureCore] Retroarch.Open() intercepted. Preventing RetroArch launch.");
-                // This is the key: We tell the retroarch component that we are "running"
-                // so that the game doesn't think the launch failed and turn itself off.
                 __instance.isRunning = true;
-                return false; // Skip the original Open() method.
+                return false;
             }
-
-            return true; // Not our system, let RetroArch launch normally.
+            return true;
         }
 
         public static bool OnInternalPowerPrefix(GameSystemState __instance, bool on)
@@ -477,43 +983,249 @@ namespace WIGUx.Modules.WindowCaptureModule
             Game game = __instance.gameSystem.Game;
             if (game == null || string.IsNullOrEmpty(game.path)) return true;
 
-            string gameDirectory = Path.GetDirectoryName(game.path);
-            string gameNameWithoutExt = Path.GetFileNameWithoutExtension(game.path);
+            string emuVrRoot = Directory.GetParent(Application.dataPath).FullName;
+            string absoluteGamePath = Path.Combine(emuVrRoot, game.path);
+
+            string gameDirectory = Path.GetDirectoryName(absoluteGamePath);
+            string gameNameWithoutExt = Path.GetFileNameWithoutExtension(absoluteGamePath);
             string winFilePath = Path.Combine(gameDirectory, gameNameWithoutExt + ".win");
             string batFilePath = Path.Combine(gameDirectory, gameNameWithoutExt + ".bat");
-            
-            if (!File.Exists(winFilePath) || !File.Exists(batFilePath))
-            {
-                return true; // Not our game, run original method.
-            }
-            
+
+            if (!File.Exists(winFilePath) || !File.Exists(batFilePath)) return true;
+
             if (on)
             {
                 if (__instance.gameSystem.gameObject.GetComponent<WindowCaptureInstance>() == null)
                 {
-                    Logger.Msg($"[CaptureCore] Intercepting Power-On for '{game.name}'.");
-                    string windowIdentifier = File.ReadAllText(winFilePath).Trim();
-                    if (string.IsNullOrEmpty(windowIdentifier))
+                    Logger.Msg($"[CaptureCore] Intercepting Power-On for custom capture game '{game.name}'.");
+                    string captureTarget = File.ReadAllText(winFilePath).Trim().Replace("\r\n", "\n");
+                    if (string.IsNullOrEmpty(captureTarget))
                     {
-                        Logger.Error($"[CaptureCore] .win file for '{game.name}' is empty.");
-                        return true; // Let original method run and likely fail.
+                        Logger.Error($"[CaptureCore] .win file for '{game.name}' is empty. Aborting.");
+                        return true;
                     }
 
-                    // Add our component to launch the capture instead.
                     var instance = __instance.gameSystem.gameObject.AddComponent<WindowCaptureInstance>();
                     instance.batPath = batFilePath;
-                    instance.windowIdentifier = windowIdentifier;
+                    instance.windowIdentifier = captureTarget;
+                    string[] winFileLines = captureTarget.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                    instance.gridConfiguration = winFileLines.Length > 2 ? winFileLines[2].Trim() : null;
+                    __instance.gameSystem.NetworkretroarchIsRunning = true;
                 }
             }
             else
             {
                 var instance = __instance.gameSystem.GetComponent<WindowCaptureInstance>();
-                if (instance != null) UnityEngine.Object.Destroy(instance);
+                if (instance != null)
+                {
+                    Logger.Msg($"[CaptureCore] Intercepting Power-Off for '{__instance.gameSystem.Game.name}'. Initiating cleanup.");
+                    instance.SendMessage("StartCleanup", options: SendMessageOptions.DontRequireReceiver);
+                }
             }
-
-            // Let the original InternalPower method run. It will handle all the state changes,
-            // but our new patch on Retroarch.Open() will stop the emulator from actually launching.
             return true;
         }
+
+        public static void RegisterCaptureProcess(Process process)
+        {
+            runningCaptureProcesses.Add(process);
+        }
+
+        private void CreateTestTouchscreen()
+        {
+            testTouchscreen = GameObject.CreatePrimitive(PrimitiveType.Quad);
+            testTouchscreen.name = "TestWintouchScreen";
+
+            float baseHeight = 0.9f;
+            float aspectRatio = (float)CaptureCore.GetSystemMetrics(CaptureCore.SM_CXSCREEN) / CaptureCore.GetSystemMetrics(CaptureCore.SM_CYSCREEN);
+            float newWidth = baseHeight * aspectRatio;
+
+            testTouchscreen.transform.position = new Vector3(0, 1.2f, 1.5f);
+            testTouchscreen.transform.rotation = Quaternion.Euler(0, 180, 0);
+            testTouchscreen.transform.localScale = new Vector3(newWidth, baseHeight, 1.0f);
+
+            Object.Destroy(testTouchscreen.GetComponent<Collider>());
+            var physicalCollider = testTouchscreen.AddComponent<BoxCollider>();
+            physicalCollider.size = new Vector3(1, 1, 0.05f);
+
+            // Add a larger trigger collider for hover detection
+            var hoverCollider = testTouchscreen.AddComponent<BoxCollider>();
+            hoverCollider.isTrigger = true;
+            // Make it slightly larger and thicker to detect the hand before it touches
+            hoverCollider.size = new Vector3(1.1f, 1.1f, 0.4f); 
+
+            var instance = testTouchscreen.AddComponent<WindowCaptureInstance>();
+            instance.InitializeForTestScreen();
+            Logger.Msg("[CaptureCore] Test touchscreen created. Press F2 again to destroy.");
+        }
+    }
+    
+    public class HandTouchInteraction : MonoBehaviour
+    {
+        private WindowCaptureInstance captureInstance;
+        private BoxCollider physicalCollider;
+        private BoxCollider hoverCollider;
+        private uint touchId;
+
+        private enum HandState { OutOfRange, Hovering, Drawing }
+        private HandState currentState = HandState.OutOfRange;
+
+        public void Initialize(WindowCaptureInstance instance, BoxCollider physical, BoxCollider hover, uint id)
+        {
+            captureInstance = instance;
+            physicalCollider = physical;
+            hoverCollider = hover;
+            touchId = id;
+
+            var handRb = gameObject.GetComponent<Rigidbody>();
+            if (handRb == null)
+            {
+                handRb = gameObject.AddComponent<Rigidbody>();
+                handRb.isKinematic = false;
+                handRb.useGravity = false;
+            }
+            var handCollider = gameObject.GetComponent<SphereCollider>();
+            if (handCollider == null)
+            {
+                handCollider = gameObject.AddComponent<SphereCollider>();
+                handCollider.radius = 0.02f;
+            }
+        }
+
+        void OnCollisionEnter(Collision collision)
+        {
+            if (collision.collider == physicalCollider)
+            {
+                currentState = HandState.Drawing;
+                ContactPoint contact = collision.contacts[0]; // Use the first contact point
+                captureInstance.UpdateTouchState(touchId, contact.point, true, transform);
+            }
+        }
+
+        void OnCollisionStay(Collision collision)
+        {
+            if (collision.collider == physicalCollider)
+            {
+                currentState = HandState.Drawing;
+                ContactPoint contact = collision.contacts[0]; // Use the first contact point
+                captureInstance.UpdateTouchState(touchId, contact.point, false, transform);
+                
+                var handRb = GetComponent<Rigidbody>();
+                if (handRb != null) handRb.velocity = Vector3.zero;
+            }
+        }
+
+        void OnCollisionExit(Collision collision)
+        {
+            if (collision.collider == physicalCollider)
+            {
+                // We are no longer drawing. The OnTriggerStay will determine if we are now hovering or out of range.
+                currentState = HandState.Hovering; 
+                captureInstance.HandleDrawEnd(touchId);
+            }
+        }
+
+        // --- Trigger Volume for Hovering ---
+        void OnTriggerEnter(Collider other)
+        {
+            if (other.gameObject == gameObject && currentState == HandState.OutOfRange)
+            if (other == hoverCollider && currentState == HandState.OutOfRange)
+            {
+                currentState = HandState.Hovering;
+            }
+        }
+
+        void OnTriggerStay(Collider other)
+        {
+            if (other.gameObject == gameObject)
+            if (other == hoverCollider)
+            {
+                // If we are not physically touching the screen, we are hovering.
+                if (currentState == HandState.Hovering)
+                {
+                    Vector3 closestPoint = other.ClosestPoint(transform.position);
+                    captureInstance.HandleHover(touchId, closestPoint, transform);
+                }
+            }
+        }
+
+        void OnTriggerExit(Collider other)
+        {
+            if (other.gameObject == gameObject)
+            if (other == hoverCollider)
+            {
+                // If we were hovering, we are now out of range. Send an UP to cancel the hover.
+                if (currentState == HandState.Hovering) captureInstance.HandleDrawEnd(touchId);
+                currentState = HandState.OutOfRange;
+            }
+        }
+    }
+
+    public static class WinTouch
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct POINTER_TOUCH_INFO
+        {
+            public POINTER_INFO pointerInfo;
+            public TOUCH_FLAGS touchFlags;
+            public TOUCH_MASK touchMask;
+            public RECT contact;
+            public RECT contactRaw;
+            public uint orientation;
+            public uint pressure;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct POINTER_INFO
+        {
+            public POINTER_INPUT_TYPE pointerType;
+            public uint pointerId;
+            public uint frameId;
+            public POINTER_FLAGS pointerFlags;
+            public IntPtr sourceDevice;
+            public IntPtr hwndTarget;
+            public POINT ptPixelLocation;
+            public POINT ptHimetricLocation;
+            public POINT ptPixelLocationRaw;
+            public POINT ptHimetricLocationRaw;
+            public uint dwTime;
+            public uint historyCount;
+            public int inputData;
+            public uint dwKeyStates;
+            public ulong PerformanceCount;
+            public POINTER_BUTTON_CHANGE_TYPE ButtonChangeType;
+        }
+
+        public enum POINTER_INPUT_TYPE { PT_POINTER = 1, PT_TOUCH = 2, PT_PEN = 3, PT_MOUSE = 4 }
+
+        [Flags]
+        public enum POINTER_FLAGS : uint
+        {
+            NONE = 0x00000000, NEW = 0x00000001, INRANGE = 0x00000002, INCONTACT = 0x00000004,
+            FIRSTBUTTON = 0x00000010, SECONDBUTTON = 0x00000020, THIRDBUTTON = 0x00000040, FOURTHBUTTON = 0x00000080, 
+            FIFTHBUTTON = 0x00000100, PRIMARY = 0x00002000,
+            CONFIDENCE = 0x00004000, CANCELED = 0x00008000, DOWN = 0x00010000,
+            UPDATE = 0x00020000, UP = 0x00040000, WHEEL = 0x00080000, HWHEEL = 0x00100000,
+            CAPTURECHANGED = 0x00200000
+        }
+
+        public enum POINTER_BUTTON_CHANGE_TYPE
+        {
+            NONE, FIRSTBUTTON_DOWN, FIRSTBUTTON_UP, SECONDBUTTON_DOWN, SECONDBUTTON_UP,
+            THIRDBUTTON_DOWN, THIRDButton_UP, FOURTHBUTTON_DOWN, FOURTHBUTTON_UP,
+            FIFTHBUTTON_DOWN, FIFTHBUTTON_UP
+        }
+
+        [Flags] public enum TOUCH_FLAGS { NONE = 0x00000000 }
+        [Flags] public enum TOUCH_MASK { NONE = 0x00000000, CONTACTAREA = 0x00000001, ORIENTATION = 0x00000002, PRESSURE = 0x00000004 }
+        [StructLayout(LayoutKind.Sequential)] public struct RECT { public int left, top, right, bottom; }
+        [StructLayout(LayoutKind.Sequential)] public struct POINT { public int x, y; }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool InitializeTouchInjection(uint maxCount, TOUCH_FEEDBACK touchFeedback);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool InjectTouchInput(int count, [In] POINTER_TOUCH_INFO[] contacts);
+
+        public enum TOUCH_FEEDBACK { DEFAULT = 0x1, INDIRECT = 0x2, NONE = 0x3 }
     }
 }

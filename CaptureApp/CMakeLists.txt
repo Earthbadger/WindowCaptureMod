@@ -10,7 +10,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # --- IMPORTANT ---
 # Tell CMake where to find the Spout SDK we just built and installed.
 # Replace the path below with the actual path to YOUR Spout install directory.
-set(Spout2_DIR "c:/Users/Earth/Downloads/Spout2-master/INSTALL/lib/cmake/spout2")
+set(Spout2_DIR "PATH TO SPOUT2 HERE/INSTALL/lib/cmake/spout2")
 
 # Find the Spout2 package using the path we just set
 find_package(Spout2 REQUIRED)
@@ -35,8 +35,8 @@ target_link_libraries(SpoutWGCSender PRIVATE
 
 # Add Spout source directories to include path to ensure headers are found
 target_include_directories(SpoutWGCSender PRIVATE
-    "c:/Users/Earth/Downloads/Spout2-master/SPOUTSDK/SpoutDirectX/SpoutDX"
-    "c:/Users/Earth/Downloads/Spout2-master/SPOUTSDK/SpoutGL"
+    "PATH TO SPOUT2 HERE/SPOUTSDK/SpoutDirectX/SpoutDX"
+    "PATH TO SPOUT2 HERE/Spout2-master/SPOUTSDK/SpoutGL"
 )
 
 # Add a post-build command to automatically copy the SpoutDX.dll
@@ -65,4 +65,5 @@ set(CMAKE_INSTALL_PREFIX "${CMAKE_CURRENT_BINARY_DIR}/install")
 
 include(GNUInstallDirs)
 install(TARGETS SpoutWGCSender RUNTIME DESTINATION bin)
+
 install(FILES "${Spout2_DIR}/../../../bin/SpoutDX.dll" DESTINATION bin)

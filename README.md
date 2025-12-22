@@ -1,73 +1,59 @@
-# WindowCaptureMod
-Window Capture Modification For EmuVR Leveraging Melonloader &amp; The WIGUx/Umbrella Modification
-----------------
-Releases
-----------------
-https://github.com/Earthbadger/WindowCaptureMod/releases
-----------------
-Prerequisites for Binary
-----------------
-- EmuVR
-- WIGUx/Umbrella (available through TeamGT's Arcade Club under "ugc-share" in the EmuVR Discord or in the WIGUx Telegram)
-----------------
-Installation
-----------------
-1. Ensure all prerequisites are installed.
-2. Put WindowCaptureMod.dll directly into your EmuVR Mods folder.
-----------------
-How to Add Your Own Games
-----------------
-This mod works by using the same standard as the existing Retroarch capture core standard in EmuVR `.win` files.
+# Window Capture Mod for EmuVR
 
-1.  **Create a Game Folder:**
-    Create a new folder for your Captured games inside your `EmuVR\Games\` directory. For example: `EmuVR\Games\My PC Games\`.
+MelonLoader Window Capture Mod For EmuVR Built Using Spout And Windows Graphics Capture 
 
-2.  **Create a .bat Launcher:**
-    Inside your new folder, create a batch file (`.bat`) to launch your game. For example, create `MyGame.bat`.
-    The content should be simple, like:
-    `cd /d "Path To Game"
-     "MyGame.exe"`
-    (Replace "MyGame.exe" with the actual name of your game's executable.)
+## Features
 
-4.  **Create a .win "File":**
-    In the same folder, create a new text file and rename it to have a `.win` extension (e.g., `MyGame.win`).
-    Open this file with a text editor and write the **exact name of the game's main window title OR the name of its process executable** (e.g., `MyGame.exe`). Using the process name is usually more reliable.
+*   **High Performance Capture:** Uses the Windows Graphics Capture API via `SpoutWGCSender` for fast, low-latency window capture.
 
-    Example `MyGame.win` content:
-    `MyGame.exe`
+## Installation
 
-    The "Capture Core Companion" from TeamGT's EmuVRX project can be used as a simple way to create compatible files for this mod 
+1.  Download the latest release.
+2.  Copy `WindowCaptureMod.dll` to your `EmuVR\Mods` folder.
+3.  Create a folder named `WindowCapture` inside `EmuVR\UserData`.
+4.  Copy `SpoutWGCSender.exe` to `EmuVR\UserData\WindowCapture\`.
 
-5.  **Scan for Games:**
-    Run the EmuVR Game Scanner and add the new folder you created and click "Scan Games For EmuVR". It will automatically detect your new `.win` files as game cartridges. You can now grab them and insert them into any console to start playing!
-----------------
-Prerequisites for Compiling
-----------------
-Visual Studio 2022
-.NET 4.7.2 SDK
-EmuVR installation With WIGUx/Umbrella Modification
-----------------
-Instructions for Compiling
-----------------
-1. Clone the Git repo with 
-https://github.com/Earthbadger/WindowCaptureMod.git
+## Usage
 
-2. Open the cloned Git repo in your IDE of choice or terminal.
+### 1. Basic Window Capture
+To capture a specific window (e.g., a browser, a media player, or a running game):
+1.  Create a `.win` file in your Game System Folder `EmuVR\Games\(Example System)`
+2.  Open the file and type the exact title or the name of the `.exe` of the Application you want to capture.
+    *   Example: `Mozilla Firefox`
+    *  Example: `Firefox.exe`
+3.  Scan your games in EmuVR.
+4.  Insert the cartridge/disc into a system and turn it on.
 
-3. Edit line 5 of the WindowCaptureModule.csproj and replace "REPLACE ME" with the path to your EmuVR installation
+### 2. Auto-Launching
+To have EmuVR launch the game for you:
+1.  Create your `.win` file as described above (e.g., `Doom.win`) containing the window title or `.exe` name (e.g., `DOOM Eternal`).
+2.  Create a Batch file (`.bat`) with the **exact same name** in the same folder (e.g., `Doom.bat`).
+3.  Inside the `.bat` file, put the command to launch your game.
+    *   Example: `start "" "C:\Games\Doom Eternal\DOOMEternalx64vk.exe"`
+    *   Steam Example: `start steam://rungameid/782330`
+4.  When you turn on the System in EmuVR, the mod will execute the `.bat` file and wait for the window specified in the `.win` file to appear.
+
+### 3. Hiding the Cursor
+To hide the mouse cursor in the capture, add `--no-cursor` after the window title in your `.win` file.
+
+**Example `MyGame.win`:**
+```text
+"My Game Window Title" --no-cursor
 ```
-<EmuVRPath>REPLACE ME</EmuVRPath>
-```
-4. Open the terminal and type
-   dotnet build -c Release
-   
-5. Compiled Binary will be in
-   .\bin\Release\net472
-   
-6. Copy WindowCaptureMod.dll to your EmuVR Installation's "Mods" folder
-----------------
-Why Create This?
-----------------
+
+## Requirements
+*   MelonLoader (installed with Wigu/WIGUx/Umbrella)
+*   Windows 10 (version 1809 or later) or Windows 11 (required for WGC API).
+
+## Troubleshooting
+
+*   **Black Screen:** Ensure the window you are trying to capture is not minimized.
+*   **Game doesn't launch:** Check your `.bat` file by running it manually outside of EmuVR to ensure it works.
+*   **Window not found:** Ensure the text in your `.win` file matches the window title exactly (case-insensitive).
+
+
+## Why Create This
+
 My reasoning for creating a mod that seperates window capture into its own thing is purely due to the fact of how EMUVR itself currently handles window capture.
 
 As it stands EMUVR uses Retroarch with a core dedicated to capturing windows, The issue with this is that due to the version of Retroarch that EMUVR uses this causes issues with fast paced and latency sensitive games such as rhythm games, for example when running a game through EMUVR's stock implimentation for capturing windows I would notice that games running in a window would look like were running at a lower framerate than they would outside of EMUVR.

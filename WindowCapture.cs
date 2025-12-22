@@ -1,519 +1,611 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Reflection;
 using HarmonyLib;
-using UnityEngine;
-using System.Diagnostics;
-using EmuVR.InputManager;
+using Klak.Spout;
 using MelonLoader;
-using WIGU;
+using UnityEngine;
 
-[assembly: MelonInfo(typeof(WIGUx.Modules.WindowCaptureModule.CaptureCore), "Window Capture Mod", "1.0.0", "Earth🐾")]
+[assembly: MelonInfo(typeof(WIGUx.Modules.WindowCaptureModule.WindowCapture), "WindowCaptureMod", "2.0.0", "Earth")]
 [assembly: MelonGame("EmuVR", "EmuVR")]
-[assembly: HarmonyDontPatchAll] // We will patch manually. 
 
 namespace WIGUx.Modules.WindowCaptureModule
 {
-    /// <summary>
-    /// Manages the P/Invoke and texture creation for a SINGLE window capture instance.
-    /// This component is added and removed dynamically by the WindowCaptureHook.
-    /// </summary>
+    public class WindowCapture : MelonMod
+    {
+        public static WindowCapture Instance { get; private set; }
+
+        // --- Reflection Cache for Klak.Spout ---
+        public static Type _pluginEntryType;
+        public static Type _utilType;
+        public static Type _eventType;
+        public static MethodInfo _checkValidMethod;
+        public static MethodInfo _createReceiverMethod;
+        public static MethodInfo _getTexturePointerMethod;
+        public static MethodInfo _getTextureWidthMethod;
+        public static MethodInfo _getTextureHeightMethod;
+        public static MethodInfo _issuePluginEventMethod;
+        public static MethodInfo _destroyMethod;
+
+        public override void OnInitializeMelon()
+        {
+            Instance = this;
+            CaptureCore.Initialize();
+            CaptureCore.Logger.Msg("[WindowCapture] Initialized.");
+            
+            // Initialize Reflection for Spout internals
+            try
+            {
+                CaptureCore.Logger.Msg("[WindowCapture] Initializing Spout reflection...");
+                var assembly = typeof(Klak.Spout.SpoutReceiver).Assembly;
+                _pluginEntryType = assembly.GetType("Klak.Spout.PluginEntry");
+                _utilType = assembly.GetType("Klak.Spout.Util");
+                _eventType = assembly.GetType("Klak.Spout.PluginEntry+Event"); // Nested enum
+
+                if (_pluginEntryType != null && _utilType != null && _eventType != null)
+                {
+                    _checkValidMethod = _pluginEntryType.GetMethod("CheckValid", BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
+                    _createReceiverMethod = _pluginEntryType.GetMethod("CreateReceiver", BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
+                    _getTexturePointerMethod = _pluginEntryType.GetMethod("GetTexturePointer", BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
+                    _getTextureWidthMethod = _pluginEntryType.GetMethod("GetTextureWidth", BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
+                    _getTextureHeightMethod = _pluginEntryType.GetMethod("GetTextureHeight", BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
+
+                    _issuePluginEventMethod = _utilType.GetMethod("IssuePluginEvent", BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
+                    _destroyMethod = _utilType.GetMethod("Destroy", BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
+                    CaptureCore.Logger.Msg("[WindowCapture] Spout reflection successful.");
+                }
+                else
+                {
+                    CaptureCore.Logger.Error("[WindowCapture] Could not find internal Spout types via Reflection.");
+                }
+            }
+            catch (Exception e)
+            {
+                CaptureCore.Logger.Error($"[WindowCapture] Error initializing Spout reflection: {e}");
+            }
+        }
+    }
+
     public class WindowCaptureInstance : MonoBehaviour
     {
+        private string windowIdentifier;
+        private string spoutName;
+        private Process captureProcess;
+        private Process gameProcess;
+
+        private SpoutReceiver spoutReceiver;
+
         private GameSystem gameSystem;
         private ScreenController screenController;
-        private ScreenReceiver screenReceiver;
-        private Retroarch retroarch;
-        private Texture originalEmissionTexture;
-        private Color originalEmissionColor;
+        private MeshRenderer screenRenderer;
+        private MaterialPropertyBlock screenPropertyBlock;
+        
+        private FieldInfo screenAspectRatioField;
+        private FieldInfo overscanField;
 
-        private IntPtr windowHandle = IntPtr.Zero;
-        private Texture2D windowTexture;
-        private Coroutine captureCoroutine;
-        private RenderTexture flippedTexture;
-        public Process gameProcess;
-        private bool isCleaningUp = false;
-        private bool hasGameInitially = false; // New flag to track initial state
-        public string batPath;
-        public string windowIdentifier;
-
-        void Awake()
+        void OnDestroy()
         {
-            gameSystem = GetComponent<GameSystem>();
-            if (gameSystem == null)
+            if (captureProcess != null && !captureProcess.HasExited)
             {
-                CaptureCore.Logger.Error("[CaptureCore] Could not find GameSystem component. Self-destructing.");
-                Destroy(this);
-                return;
+                CaptureCore.Logger.Msg("[CaptureCore] Killing capture process.");
+                try { captureProcess.Kill(); } catch {}
+                captureProcess = null;
             }
-            // GameSystem can have an embedded screen or be connected to an external one.
-            // We need to get the correct ScreenController instance.
-            if (gameSystem.IsUsingEmbeddedScreen)
-                screenController = GetComponent<ScreenController>();
-            else if (gameSystem.Screen != null)
-                screenController = gameSystem.Screen.GetComponent<ScreenController>();
-
-            if (screenController != null)
+            if (gameProcess != null && !gameProcess.HasExited)
             {
-                screenReceiver = screenController.GetComponent<ScreenReceiver>();
+                CaptureCore.Logger.Msg("[CaptureCore] Killing game process.");
+                try { gameProcess.Kill(); } catch {}
+                gameProcess = null;
+            }
+            if (spoutReceiver != null) Destroy(spoutReceiver);
+            if (screenController != null) screenController.receivingTexture = false;
+            if (screenRenderer != null) screenRenderer.SetPropertyBlock(null);
+        }
+
+        public void Initialize(string windowName, bool hideCursor, string launchPath)
+        {
+            this.windowIdentifier = windowName;
+            
+            // 0. Launch Game Process if requested
+            if (!string.IsNullOrEmpty(launchPath))
+            {
+                // Always resolve to a full path to avoid ambiguity with Process.Start
+                string fullLaunchPath = Path.GetFullPath(launchPath);
+
+                if (File.Exists(fullLaunchPath))
+                {
+                    try
+                    {
+                        string workingDir = Path.GetDirectoryName(fullLaunchPath);
+                        ProcessStartInfo gameInfo = new ProcessStartInfo(fullLaunchPath);
+                        gameInfo.WorkingDirectory = workingDir;
+                        gameProcess = Process.Start(gameInfo);
+                        CaptureCore.Logger.Msg($"[CaptureCore] Launched game: {fullLaunchPath}");
+                    }
+                    catch (Exception e)
+                    {
+                        CaptureCore.Logger.Error($"[CaptureCore] Failed to launch game: {e.Message}");
+                    }
+                }
+                else
+                {
+                    CaptureCore.Logger.Error($"[CaptureCore] Could not find game to launch at: {fullLaunchPath} (from original path: {launchPath})");
+                }
             }
 
-            retroarch = GetComponent<Retroarch>();
-            CaptureCore.Logger.Msg($"[CaptureCore] Instance created for {gameObject.name}.");
+            bool isExternalSpout = windowName.StartsWith("spout:", StringComparison.OrdinalIgnoreCase);
+
+            if (isExternalSpout)
+            {
+                this.spoutName = windowName.Substring(6);
+                CaptureCore.Logger.Msg($"[CaptureCore] Connecting to external Spout sender: {this.spoutName}");
+            }
+            else
+            {
+                this.spoutName = "GameCaptureWGC";
+                // Start the capture loop to wait for the window and handle launchers
+                StartCoroutine(CaptureLoop(windowName, hideCursor));
+            }
+
+            // 2. Setup Spout Receiver (Video)
+            spoutReceiver = gameObject.AddComponent<SpoutReceiver>();
+            spoutReceiver.sourceName = spoutName;
+        }
+
+        private IEnumerator CaptureLoop(string windowName, bool hideCursor)
+        {
+            string exePath = Path.Combine(Directory.GetParent(Application.dataPath).FullName, "UserData", "WindowCapture", "SpoutWGCSender.exe");
+            if (!File.Exists(exePath))
+            {
+                CaptureCore.Logger.Error($"[CaptureCore] SpoutWGCSender.exe not found at: {exePath}");
+                yield break;
+            }
+
+            // Kill any orphaned SpoutWGCSender processes to prevent conflicts
+            foreach (var proc in Process.GetProcessesByName("SpoutWGCSender"))
+            {
+                try { proc.Kill(); } catch { }
+            }
+
+            string target = windowName.Replace("\"", "");
+            string args = $"\"{target}\"";
+            if (hideCursor) args += " --no-cursor";
+
+            ProcessStartInfo startInfo = new ProcessStartInfo(exePath)
+            {
+                Arguments = args,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WorkingDirectory = Path.GetDirectoryName(exePath),
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+
+            while (true)
+            {
+                float startTime = Time.time;
+                CaptureCore.Logger.Msg($"[CaptureCore] Launching SpoutWGCSender: {exePath} {args}");
+
+                bool processStarted = false;
+
+                try
+                {
+                    captureProcess = Process.Start(startInfo);
+
+                    captureProcess.OutputDataReceived += (sender, e) => {
+                        if (!string.IsNullOrEmpty(e.Data)) CaptureCore.Logger.Msg($"[SpoutWGCSender] {e.Data}");
+                    };
+                    captureProcess.ErrorDataReceived += (sender, e) => {
+                        if (!string.IsNullOrEmpty(e.Data)) CaptureCore.Logger.Error($"[SpoutWGCSender ERROR] {e.Data}");
+                    };
+                    captureProcess.BeginOutputReadLine();
+                    captureProcess.BeginErrorReadLine();
+
+                    CaptureCore.Logger.Msg($"[CaptureCore] Started SpoutWGCSender process (PID: {captureProcess.Id})");
+                    processStarted = true;
+                }
+                catch (Exception e)
+                {
+                    CaptureCore.Logger.Error($"[CaptureCore] Failed to start SpoutWGCSender.exe: {e.Message}");
+                }
+
+                if (!processStarted)
+                {
+                    yield return new WaitForSeconds(5f);
+                    continue;
+                }
+
+                // Wait for process to exit
+                while (captureProcess != null && !captureProcess.HasExited)
+                {
+                    yield return new WaitForSeconds(0.5f);
+                }
+
+                float runDuration = Time.time - startTime;
+                
+                // Heuristic: If it ran for > 2 seconds, assume it connected successfully and the game just closed.
+                // If less, assume it failed to find the window (game starting up, or launcher active).
+                if (runDuration > 2f)
+                {
+                    CaptureCore.Logger.Msg($"[CaptureCore] Capture process exited after {runDuration:F2}s. Shutting down system.");
+                    if (gameSystem != null && gameSystem.SystemState.IsOn)
+                    {
+                        gameSystem.SystemState.Power(false);
+                    }
+                    UnityEngine.Object.Destroy(this);
+                    yield break;
+                }
+                else
+                {
+                    // It exited quickly, likely window not found. Retry.
+                    yield return new WaitForSeconds(1f);
+                }
+            }
         }
 
         void Start()
         {
-            TakeOverScreens();
-            if (screenController != null)
+            gameSystem = GetComponent<GameSystem>();
+            if (gameSystem == null) { Destroy(this); return; }
+
+            if (gameSystem.IsUsingEmbeddedScreen)
+                SetScreenController(GetComponent<ScreenController>());
+            else if (gameSystem.Screen != null)
+                SetScreenController(gameSystem.Screen.GetComponent<ScreenController>());
+        }
+
+        void LateUpdate()
+        {
+            // Self-destruct if the game is no longer a wgc game
+            if (gameSystem != null)
             {
-                // Tell the screen controller that we are providing a texture.
-                // This prevents it from trying to show the "TV noise" or "off" texture.
+                if (gameSystem.Game == null || gameSystem.Game.core != "wgc_libretro")
+                {
+                    CaptureCore.Logger.Msg($"[CaptureCore] Game is no longer a window capture game. Destroying instance.");
+                    UnityEngine.Object.Destroy(this);
+                    return;
+                }
+            }
+
+            if (gameSystem.Screen != null && screenController?.gameObject != gameSystem.Screen)
+                SetScreenController(gameSystem.Screen.GetComponent<ScreenController>());
+            else if (gameSystem.Screen == null && screenController != null)
+                SetScreenController(null);
+
+            if (screenController == null || screenRenderer == null) return;
+
+            Texture receivedTexture = spoutReceiver?.receivedTexture;
+            bool hasTexture = receivedTexture != null && receivedTexture.width > 8;
+            
+            // Check if the system is running
+            if (hasTexture && gameSystem.retroarchIsRunning)
+            {
                 screenController.receivingTexture = true;
-            }
-            captureCoroutine = StartCoroutine(LaunchAndCapture());
-        }
+                screenController.LightColor = Color.black;
+                screenController.LightIntensity = 0f;
 
-        void Update()
-        {
-            if (isCleaningUp) return; // Prevent any logic from running while cleaning up.
+                screenRenderer.GetPropertyBlock(screenPropertyBlock);
+                screenPropertyBlock.SetColor("_Color", Color.black);
+                screenPropertyBlock.SetColor("_EmissionColor", Color.white);
+                screenPropertyBlock.SetTexture("_EmissionMap", receivedTexture);
 
-            if (!hasGameInitially && gameSystem.Game != null)
-            {
-                hasGameInitially = true;
-            }
-
-            // If we started with a game and now we don't, it means the cartridge was ejected.
-            // This prevents the component from destroying itself during initialization.
-            if (hasGameInitially && gameSystem.Game == null)
-            {
-                CaptureCore.Logger.Msg($"[CaptureCore] Game medium ejected from {gameObject.name}. Starting cleanup.");
-                StartCleanup();
-                return; // Exit early to prevent other checks
-            }
-
-            // If the GameSystem's retroarch state is false, but we are still running, it means the system was powered off.
-            if (!gameSystem.retroarchIsRunning && captureCoroutine != null)
-            {
-                CaptureCore.Logger.Msg($"[CaptureCore] GameSystem for {gameObject.name} has been powered off. Starting cleanup.");
-                StartCleanup();
-            }
-        }
-
-        private void TakeOverScreens()
-        {
-            if (screenController == null || screenController.screenMaterial == null)
-            {
-                CaptureCore.Logger.Warning($"[CaptureCore] No screens found on {gameObject.name} to display capture.");
-                return;
-            }
-
-            // Store the original texture and color from the ScreenController's material.
-            originalEmissionTexture = screenController.screenMaterial.GetTexture("_EmissionMap");
-            originalEmissionColor = screenController.screenMaterial.GetColor("_EmissionColor");
-        }
-
-        private void ApplyTextureToScreens(Texture texture)
-        {
-            if (screenController == null || screenController.screenMaterial == null) return;
-
-            // We now directly modify the material instance that ScreenController owns.
-            // This preserves the connection for other game systems like Retroarch.
-            screenController.screenMaterial.SetTexture("_EmissionMap", texture);
-            screenController.screenMaterial.SetColor("_EmissionColor", Color.white);
-            screenController.screenMaterial.EnableKeyword("_EMISSION");
-
-            // The screen shader uses a custom "_ScreenStretch" property for scaling.
-            // Setting it to a value slightly larger than 1 (like the game's overscan)
-            // ensures the texture stretches to fill the entire screen area.
-            screenController.screenMaterial.SetVector("_ScreenStretch", new Vector2(1.02f, 1.02f));
-        }
-
-        void OnDestroy()
-        {
-            // The primary cleanup is now handled by CleanupAndDestroy().
-            // OnDestroy is now just a final safety net.
-            if (!isCleaningUp)
-            {
-                // This might be called if the GameObject is destroyed unexpectedly.
-                // We should still try to clean up the process.
-                KillGameProcess();
-            }
-        }
-
-        private void KillGameProcess()
-        {
-            // Ensure the game system knows the game is no longer running.
-            if (retroarch != null)
-            {
-                // If we were the controlled system, clear it.
-                if (GameSystem.ControlledSystem == gameSystem && gameSystem != null)
+                // Aspect Ratio Correction
+                if (screenAspectRatioField != null && overscanField != null)
                 {
-                    CaptureCore.Logger.Msg("[CaptureCore] Clearing controlled system.");
-                    GameSystem.ControlledSystem = null;
+                    float screenAspect = (float)screenAspectRatioField.GetValue(screenController);
+                    Vector2 overscan = (Vector2)overscanField.GetValue(screenController);
+                    if (screenAspect <= 0.001f) screenAspect = 1.3333f;
+                    float texAspect = (float)receivedTexture.width / receivedTexture.height;
+                    float ratio = texAspect / screenAspect;
+                    Vector2 stretch = ratio < 1.0f ? new Vector2(1.0f / ratio, 1.0f) : new Vector2(1.0f, ratio);
+                    screenPropertyBlock.SetVector("_ScreenStretch", new Vector4(overscan.x * stretch.x, overscan.y * stretch.y, 0, 0));
                 }
 
-                retroarch.isRunning = false;
+                screenRenderer.SetPropertyBlock(screenPropertyBlock);
             }
-            if (gameSystem != null && gameSystem.isServer && gameSystem.retroarchIsRunning)
+            else
             {
-                gameSystem.NetworkretroarchIsRunning = false;
-            }
-
-            // Close the game process we launched
-            try
-            {
-                if (gameProcess != null && !gameProcess.HasExited)
+                if (screenController.receivingTexture)
                 {
-                    CaptureCore.Logger.Msg($"[CaptureCore] Closing process {gameProcess.ProcessName}.");
-                    gameProcess.CloseMainWindow();
-                    gameProcess.Kill();
+                    screenController.receivingTexture = false;
+                    screenRenderer.SetPropertyBlock(null);
                 }
             }
-            catch (Exception e)
-            {
-                CaptureCore.Logger.Warning($"[CaptureCore] Could not close game process: {e.Message}");
-            }
         }
 
-        private void StartCleanup()
+        private void SetScreenController(ScreenController sc)
         {
-            if (isCleaningUp) return;
-            isCleaningUp = true;
-            StartCoroutine(CleanupAndDestroy());
-        }
-
-        private IEnumerator CleanupAndDestroy()
-        {
-            CaptureCore.Logger.Msg($"[CaptureCore] Running cleanup for {gameObject.name}.");
-            KillGameProcess();
-            // Restore the original texture and color to the ScreenController's material.
-            if (screenController != null)
+            if (screenController != null && screenController != sc)
             {
-                // This is the game's built-in, reliable way to reset the screen.
+                screenController.receivingTexture = false;
                 screenController.EnableOffTexture();
             }
 
-            yield return null; // Wait a frame to ensure state changes propagate.
+            screenController = sc;
 
-            if (windowTexture != null)
+            if (screenController != null)
             {
-                Destroy(windowTexture);
-            }
-            if (flippedTexture != null)
-            {
-                RenderTexture.ReleaseTemporary(flippedTexture);
-                flippedTexture = null;
-            }
-
-            Destroy(this);
-        }
-        #region Window Capture
-        private IEnumerator LaunchAndCapture()
-        {
-            // 2. Launch the game using the .bat file
-            try
-            {
-                string fullBatPath = Path.GetFullPath(batPath);
-                string gameDirectory = Path.GetDirectoryName(fullBatPath);
-                CaptureCore.Logger.Msg($"[CaptureCore] Executing: {fullBatPath}");
-                ProcessStartInfo startInfo = new ProcessStartInfo(fullBatPath)
+                var renderers = screenController.GetComponentsInChildren<Renderer>();
+                foreach (var r in renderers)
                 {
-                    WorkingDirectory = gameDirectory,
-                    UseShellExecute = true // UseShellExecute is often better for .bat files
-                };
-                Process.Start(startInfo); // Launch the batch file, but don't store this cmd process.
-            }
-            catch (Exception e)
-            {
-                CaptureCore.Logger.Error($"[CaptureCore] Failed to launch .bat file: {e.Message}");
-                Destroy(this);
-                yield break;
-            }
-
-            // Give the actual game a moment to start up after the batch file runs.
-            // This helps prevent us from capturing the cmd window by mistake.
-            for (int i = 0; i < 4; i++)
-            {
-                yield return new WaitForSeconds(0.25f);
-            }
-
-            // 3. Find the window using the identifier from the .win file
-            CaptureCore.Logger.Msg($"[CaptureCore] Searching for process/window with identifier: '{windowIdentifier}'");
-
-            // 4. Main capture loop
-            while (this != null && !this.gameObject.Equals(null)) // Loop as long as this component exists
-            {
-                // If we don't have a window handle, try to find one.
-                if (windowHandle == IntPtr.Zero || !IsWindow(windowHandle))
-                {
-                    if (windowHandle != IntPtr.Zero)
+                    if (r.sharedMaterial == screenController.screenMaterial)
                     {
-                        CaptureCore.Logger.Msg("[CaptureCore] Window handle became invalid. Searching for a new one...");
-                        windowHandle = IntPtr.Zero;
-                    }
-
-                    // Method 1: Search by Process Name (more reliable)
-                    string processName = windowIdentifier;
-                    if (processName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
-                    {
-                        processName = Path.GetFileNameWithoutExtension(processName);
-                    }
-
-                    Process[] processes = Process.GetProcessesByName(processName);
-                    if (processes.Length > 0)
-                    {
-                        // Find the first process that isn't cmd.exe and has a window.
-                        gameProcess = Array.Find(processes, p => p.ProcessName != "cmd" && p.MainWindowHandle != IntPtr.Zero);
-
-                        if (gameProcess != null)
-                        {
-                            windowHandle = gameProcess.MainWindowHandle;
-                            CaptureCore.Logger.Msg($"[CaptureCore] Found process '{processName}' by name. Handle: {windowHandle}");
-                        }
-                    }
-
-                    // Method 2: Search by Window Title (fallback)
-                    if (windowHandle == IntPtr.Zero)
-                    {
-                        windowHandle = FindWindow(null, windowIdentifier);
-                    }
-
-                    if (windowHandle != IntPtr.Zero)
-                    {
-                         CaptureCore.Logger.Msg($"[CaptureCore] Acquired window handle: {windowHandle}. Resuming capture.");
+                        screenRenderer = r as MeshRenderer;
+                        break;
                     }
                 }
+                if (screenRenderer == null) screenRenderer = screenController.GetComponentInChildren<MeshRenderer>();
 
-                // If we have a valid handle, capture it.
-                if (windowHandle != IntPtr.Zero && IsWindow(windowHandle))
-                {
-                    CaptureAndBlit(windowHandle);
-                }
-
-                // If the underlying process has exited, we should stop trying.
-                if (gameProcess != null && gameProcess.HasExited)
-                {
-                    CaptureCore.Logger.Msg("[CaptureCore] Target process has exited. Stopping capture loop.");
-                    break; // Exit the while loop
-                }
-
-                yield return null; // Capture at game's framerate (as fast as possible)
+                screenPropertyBlock = new MaterialPropertyBlock();
+                screenAspectRatioField = typeof(ScreenController).GetField("screenAspectRatio", BindingFlags.NonPublic | BindingFlags.Instance);
+                overscanField = typeof(ScreenController).GetField("overscan", BindingFlags.NonPublic | BindingFlags.Instance);
             }
-
-            // If the loop breaks, it means the window was closed.
-            // Destroy this component, which will trigger OnDestroy() for full cleanup.
-            StartCleanup();
-        }
-
-        private void CaptureAndBlit(IntPtr handle)
-        {
-            if (!GetClientRect(handle, out RECT clientRect)) return;
-
-            int width = clientRect.Right - clientRect.Left;
-            int height = clientRect.Bottom - clientRect.Top;
-
-            if (width <= 0 || height <= 0) return;
-
-            if (windowTexture == null || windowTexture.width != width || windowTexture.height != height)
+            else
             {
-                if (windowTexture != null) Destroy(windowTexture);
-                // Create the source texture as LINEAR (linear=true). This "tricks" Unity into not
-                // applying its own gamma correction, allowing the screen shader to do it.
-                windowTexture = new Texture2D(width, height, TextureFormat.BGRA32, false, true);
-
-                if (flippedTexture != null) RenderTexture.ReleaseTemporary(flippedTexture);
-                // The destination texture must also be LINEAR to prevent conversion during the blit.
-                flippedTexture = RenderTexture.GetTemporary(width, height, 0, RenderTextureFormat.Default, RenderTextureReadWrite.Linear);
-                flippedTexture.filterMode = FilterMode.Bilinear;
-                // Apply the final render texture to the screens. This only needs to be done
-                // when the texture is resized.
-                ApplyTextureToScreens(flippedTexture);
+                screenRenderer = null;
+                screenPropertyBlock = null;
             }
-
-            IntPtr hdcSrc = GetDC(handle); // Use GetDC for the client area
-            IntPtr hdcDest = CreateCompatibleDC(hdcSrc);
-            IntPtr hBitmap = CreateCompatibleBitmap(hdcSrc, width, height);
-            IntPtr hOld = SelectObject(hdcDest, hBitmap);
-
-            // You can try swapping between BitBlt and PrintWindow.
-            // PrintWindow can sometimes be faster or capture windows that BitBlt cannot.
-            // The '2' flag (PW_RENDERFULLCONTENT) is undocumented but often needed for DirectX/OpenGL windows. It's worth testing both.
-            //PrintWindow(handle, hdcDest, 2);
-            // Using CAPTUREBLT can sometimes reduce latency by bypassing DWM composition.
-            BitBlt(hdcDest, 0, 0, width, height, hdcSrc, 0, 0, SRCCOPY | CAPTUREBLT);
-            SelectObject(hdcDest, hOld);
-            ReleaseDC(handle, hdcSrc);
-
-            BITMAPINFO bmi = new BITMAPINFO();
-            bmi.biSize = 40;
-            bmi.biWidth = width;
-            bmi.biHeight = -height; // Negative height to get a top-down DIB
-            bmi.biPlanes = 1;
-            bmi.biBitCount = 32;
-            bmi.biCompression = 0; // BI_RGB
-
-            byte[] bmpBytes = new byte[width * height * 4];
-            GetDIBits(hdcDest, hBitmap, 0, (uint)height, bmpBytes, ref bmi, 0);
-
-            DeleteDC(hdcDest);
-            DeleteObject(hBitmap);
-
-            windowTexture.LoadRawTextureData(bmpBytes);
-            windowTexture.Apply();
-
-            // Flip the texture vertically using a blit.
-            Graphics.Blit(windowTexture, flippedTexture, new Vector2(1, -1), new Vector2(0, 1));
         }
-
-        #endregion
-
-        #region P/Invoke Win32 API
-        [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
-        const int SRCCOPY = 0x00CC0020;
-        const int CAPTUREBLT = 0x40000000;
-        [DllImport("gdi32.dll")] private static extern bool BitBlt(IntPtr hObject, int nXDest, int nYDest, int nWidth, int nHeight, IntPtr hObjectSource, int nXSrc, int nYSrc, int dwRop);
-        [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
-        [DllImport("user32.dll")] private static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
-        [DllImport("user32.dll", SetLastError = true)] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
-        [DllImport("user32.dll")] private static extern bool IsWindow(IntPtr hWnd);
-        [DllImport("user32.dll")] private static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
-        [DllImport("user32.dll")] private static extern IntPtr GetDC(IntPtr hWnd); // Changed from GetWindowDC
-        [DllImport("user32.dll")] private static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
-        [DllImport("gdi32.dll")] private static extern IntPtr CreateCompatibleBitmap(IntPtr hdc, int nWidth, int nHeight);
-        [DllImport("gdi32.dll")] private static extern IntPtr CreateCompatibleDC(IntPtr hdc);
-        [DllImport("gdi32.dll")] private static extern bool DeleteDC(IntPtr hdc);
-        [DllImport("gdi32.dll")] private static extern bool DeleteObject(IntPtr hObject);
-        [DllImport("gdi32.dll")] private static extern IntPtr SelectObject(IntPtr hdc, IntPtr hgdiobj);
-        [DllImport("gdi32.dll")] private static extern int GetDIBits(IntPtr hdc, IntPtr hbmp, uint uStartScan, uint cScanLines, [Out] byte[] lpvBits, ref BITMAPINFO lpbi, uint uUsage);
-
-        [StructLayout(LayoutKind.Sequential)]
-        public struct BITMAPINFO
-        {
-            public uint biSize;
-            public int biWidth, biHeight;
-            public ushort biPlanes, biBitCount;
-            public uint biCompression, biSizeImage;
-            public int biXPelsPerMeter, biYPelsPerMeter;
-            public uint biClrUsed, biClrImportant;
-        }
-        #endregion
     }
-    
-    /// <summary>
-    /// This is now a MelonMod, which is the main entry point for our code.
-    /// It will inject the hooks needed for the capture functionality to work.
-    /// </summary>
-    public class CaptureCore : MelonMod
+
+    public static class CaptureCore
     {
-        public static MelonLogger.Instance Logger { get; private set; }
-        private HarmonyLib.Harmony harmony;
+        public static MelonLogger.Instance Logger;
+        private static HarmonyLib.Harmony harmony;
 
-        public override void OnInitializeMelon()
+        public static void Initialize()
         {
-            Logger = LoggerInstance;
-            harmony = new HarmonyLib.Harmony("com.yourname.windowcapture");
-            
-            // Patch 1: Intercept the game's internal power-on logic.
-            var internalPowerOriginal = typeof(GameSystemState).GetMethod("InternalPower", BindingFlags.NonPublic | BindingFlags.Instance);
-            var internalPowerPrefix = typeof(CaptureCore).GetMethod(nameof(OnInternalPowerPrefix));
-            harmony.Patch(internalPowerOriginal, new HarmonyMethod(internalPowerPrefix));
+            Logger = new MelonLogger.Instance("WindowCaptureMod");
+            harmony = new HarmonyLib.Harmony("com.earth.windowcapture");
 
-            // Patch 2: Correctly handle re-focusing for our custom systems.
-            var updateOriginal = typeof(GameSystem).GetMethod("Update", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-            var updatePrefix = typeof(CaptureCore).GetMethod(nameof(OnGameSystemUpdatePrefix));
-            harmony.Patch(updateOriginal, new HarmonyMethod(updatePrefix));
-
-            // Patch 3: Prevent Retroarch.Open from launching for our custom games.
-            var retroarchOpenOriginal = typeof(Retroarch).GetMethod("Open", BindingFlags.Public | BindingFlags.Instance);
-            var retroarchOpenPrefix = typeof(CaptureCore).GetMethod(nameof(OnRetroarchOpenPrefix));
-            harmony.Patch(retroarchOpenOriginal, new HarmonyMethod(retroarchOpenPrefix));
-        }
-
-        public static bool OnGameSystemUpdatePrefix(GameSystem __instance, LongPressControl ___longPressControl)
-        {
-            var captureInstance = __instance.GetComponent<WindowCaptureInstance>();
-            if (captureInstance == null)
+            // Patch Retroarch.Open
+            var retroarchOpenOriginal = typeof(Retroarch).GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                .FirstOrDefault(m => m.Name == "Open" && m.GetParameters().Length == 1 && m.GetParameters()[0].ParameterType == typeof(bool));
+            if (retroarchOpenOriginal != null)
             {
-                return true; // Not our system, run the original Update method.
+                var retroarchOpenPrefix = typeof(CaptureCore).GetMethod(nameof(OnRetroarchOpenPrefix));
+                harmony.Patch(retroarchOpenOriginal, prefix: new HarmonyMethod(retroarchOpenPrefix));
+                Logger.Msg("[CaptureCore] Patched Retroarch.Open.");
+            } else {
+                Logger.Error("[CaptureCore] Could not find Retroarch.Open method to patch!");
             }
 
-            if (___longPressControl.GetLongPress(Button.EngageSystem, LongPressMode.Canceled) && (bool)(UnityEngine.Object)__instance.Screen)
+            // Patch Retroarch.Close
+            var retroarchCloseOriginal = typeof(Retroarch).GetMethod("Close", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (retroarchCloseOriginal != null)
             {
-                GameSystem.ControlledSystem = __instance;
-
-                var screenController = __instance.Screen.GetComponent<ScreenController>();
-                if (screenController != null && !screenController.tvOn)
-                {
-                    screenController.TVToggle(true);
-                }
-
-                return false; // We've handled the re-focus, so we skip the original Update method for this frame.
+                var retroarchClosePrefix = typeof(CaptureCore).GetMethod(nameof(OnRetroarchClosePrefix));
+                harmony.Patch(retroarchCloseOriginal, prefix: new HarmonyMethod(retroarchClosePrefix));
+                Logger.Msg("[CaptureCore] Patched Retroarch.Close.");
+            } else {
+                Logger.Error("[CaptureCore] Could not find Retroarch.Close method to patch!");
             }
 
-            return true;
+            var spoutUpdateOriginal = typeof(Klak.Spout.SpoutReceiver).GetMethod("Update", BindingFlags.NonPublic | BindingFlags.Instance);
+            var spoutUpdatePrefix = typeof(CaptureCore).GetMethod(nameof(OnSpoutUpdatePrefix));
+            harmony.Patch(spoutUpdateOriginal, new HarmonyMethod(spoutUpdatePrefix));
+            Logger.Msg("[CaptureCore] Patched SpoutReceiver.Update successfully.");
         }
 
         public static bool OnRetroarchOpenPrefix(Retroarch __instance)
         {
-            var gameSystem = __instance.GetComponent<GameSystem>();
-            if (gameSystem != null && gameSystem.GetComponent<WindowCaptureInstance>() != null)
+            // Check if this is a game we should handle
+            if (__instance.game == null || __instance.game.core != "wgc_libretro")
             {
-                Logger.Msg("[CaptureCore] Retroarch.Open() intercepted. Preventing RetroArch launch.");
-                // This is the key: We tell the retroarch component that we are "running"
-                // so that the game doesn't think the launch failed and turn itself off.
-                __instance.isRunning = true;
-                return false; // Skip the original Open() method.
+                return true; // Not our game, run original Open method
             }
 
-            return true; // Not our system, let RetroArch launch normally.
-        }
+            Logger.Msg($"[CaptureCore] Retroarch.Open intercepted for '{__instance.game.name}'.");
 
-        public static bool OnInternalPowerPrefix(GameSystemState __instance, bool on)
-        {
-            Game game = __instance.gameSystem.Game;
-            if (game == null || string.IsNullOrEmpty(game.path)) return true;
-
-            string gameDirectory = Path.GetDirectoryName(game.path);
-            string gameNameWithoutExt = Path.GetFileNameWithoutExtension(game.path);
-            string winFilePath = Path.Combine(gameDirectory, gameNameWithoutExt + ".win");
-            string batFilePath = Path.Combine(gameDirectory, gameNameWithoutExt + ".bat");
-            
-            if (!File.Exists(winFilePath) || !File.Exists(batFilePath))
+            // Prevent original Retroarch.Open from running
+            try
             {
-                return true; // Not our game, run original method.
-            }
-            
-            if (on)
-            {
-                if (__instance.gameSystem.gameObject.GetComponent<WindowCaptureInstance>() == null)
+                GameSystem gameSystem = __instance.GetComponent<GameSystem>();
+                if (gameSystem != null)
                 {
-                    Logger.Msg($"[CaptureCore] Intercepting Power-On for '{game.name}'.");
-                    string windowIdentifier = File.ReadAllText(winFilePath).Trim();
-                    if (string.IsNullOrEmpty(windowIdentifier))
+                    string path = gameSystem.Game.path;
+                    string windowName = "";
+                    bool hideCursor = false;
+                    string launchPath = "";
+
+                    string extension = Path.GetExtension(path).ToLower();
+                    if (extension == ".win" || extension == ".txt")
                     {
-                        Logger.Error($"[CaptureCore] .win file for '{game.name}' is empty.");
-                        return true; // Let original method run and likely fail.
+                        string content = "";
+                        if (File.Exists(path))
+                        {
+                            try {
+                                content = File.ReadAllText(path, System.Text.Encoding.UTF8).Trim();
+                                content = content.Replace("\uFEFF", ""); 
+                            } catch { }
+                        }
+
+                        if (content.Contains("--no-cursor"))
+                        {
+                            hideCursor = true;
+                            content = content.Replace("--no-cursor", "");
+                        }
+
+                        windowName = content.Trim();
+
+                        string batPath = Path.ChangeExtension(path, ".bat");
+                        if (File.Exists(batPath))
+                        {
+                            launchPath = batPath;
+                        }
+                    }
+                    else if (extension == ".bat" || extension == ".exe" || extension == ".lnk" || extension == ".url")
+                    {
+                        launchPath = path;
+                        windowName = Path.GetFileNameWithoutExtension(path);
+                    }
+                    else
+                    {
+                        windowName = Path.GetFileNameWithoutExtension(path);
                     }
 
-                    // Add our component to launch the capture instead.
-                    var instance = __instance.gameSystem.gameObject.AddComponent<WindowCaptureInstance>();
-                    instance.batPath = batFilePath;
-                    instance.windowIdentifier = windowIdentifier;
+                    // Unquote if necessary
+                    if (windowName.Length > 1 && windowName.StartsWith("\"") && windowName.EndsWith("\""))
+                    {
+                        windowName = windowName.Substring(1, windowName.Length - 2);
+                    }
+
+                    Logger.Msg($"[CaptureCore] Initializing capture for: '{windowName}', Hide Cursor: {hideCursor}, Launch: '{launchPath}'");
+
+                    var capture = gameSystem.gameObject.GetComponent<WindowCaptureInstance>() ?? gameSystem.gameObject.AddComponent<WindowCaptureInstance>();
+                    capture.Initialize(windowName, hideCursor, launchPath);
+
+                    // Manually set the 'isRunning' flag so the game knows the system is on
+                    var isRunningField = typeof(Retroarch).GetField("isRunning", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (isRunningField != null)
+                    {
+                        isRunningField.SetValue(__instance, true);
+                    }
+                    else
+                    {
+                        Logger.Warning("[CaptureCore] Could not find Retroarch 'isRunning' field.");
+                    }
                 }
             }
-            else
+            catch (Exception e)
             {
-                var instance = __instance.gameSystem.GetComponent<WindowCaptureInstance>();
-                if (instance != null) UnityEngine.Object.Destroy(instance);
+                Logger.Error($"[CaptureCore] Error in OnRetroarchOpenPrefix: {e.Message}");
             }
 
-            // Let the original InternalPower method run. It will handle all the state changes,
-            // but our new patch on Retroarch.Open() will stop the emulator from actually launching.
-            return true;
+            return false; // Skip original method
+        }
+
+        public static bool OnRetroarchClosePrefix(Retroarch __instance)
+        {
+            if (__instance.game == null || __instance.game.core != "wgc_libretro")
+            {
+                return true; // Not our game, run original Close method
+            }
+
+            Logger.Msg($"[CaptureCore] Retroarch.Close intercepted for '{__instance.game.name}'.");
+
+            var capture = __instance.GetComponent<WindowCaptureInstance>();
+            if (capture != null)
+            {
+                UnityEngine.Object.Destroy(capture);
+            }
+            
+            // The original method sets isRunning to false, so we can just let it run.
+            return true; 
+        }
+
+        public static bool OnSpoutUpdatePrefix(Klak.Spout.SpoutReceiver __instance)
+        {
+            try
+            {
+                var type = typeof(Klak.Spout.SpoutReceiver);
+                var pluginField = type.GetField("_plugin", BindingFlags.NonPublic | BindingFlags.Instance);
+                var sourceNameField = type.GetField("_sourceName", BindingFlags.NonPublic | BindingFlags.Instance);
+                var sharedTextureField = type.GetField("_sharedTexture", BindingFlags.NonPublic | BindingFlags.Instance);
+                var receivedTextureField = type.GetField("_receivedTexture", BindingFlags.NonPublic | BindingFlags.Instance);
+                var targetTextureField = type.GetField("_targetTexture", BindingFlags.NonPublic | BindingFlags.Instance);
+                var targetRendererField = type.GetField("_targetRenderer", BindingFlags.NonPublic | BindingFlags.Instance);
+                var targetMaterialPropertyField = type.GetField("_targetMaterialProperty", BindingFlags.NonPublic | BindingFlags.Instance);
+                var propertyBlockField = type.GetField("_propertyBlock", BindingFlags.NonPublic | BindingFlags.Instance);
+
+                var _checkValidMethod = WindowCapture._checkValidMethod;
+                var _createReceiverMethod = WindowCapture._createReceiverMethod;
+                var _getTexturePointerMethod = WindowCapture._getTexturePointerMethod;
+                var _getTextureWidthMethod = WindowCapture._getTextureWidthMethod;
+                var _getTextureHeightMethod = WindowCapture._getTextureHeightMethod;
+                var _issuePluginEventMethod = WindowCapture._issuePluginEventMethod;
+                var _destroyMethod = WindowCapture._destroyMethod;
+                var _eventType = WindowCapture._eventType;
+
+                if (_checkValidMethod == null)
+                {
+                    Logger.Error("[CaptureCore] Spout reflection methods not found. Aborting fallback.");
+                    return false;
+                }
+
+                IntPtr _plugin = (IntPtr)pluginField.GetValue(__instance);
+                string _sourceName = (string)sourceNameField.GetValue(__instance);
+
+                if (_plugin != IntPtr.Zero && !(bool)_checkValidMethod.Invoke(null, new object[] { _plugin }))
+                {
+                    object disposeEvent = Enum.ToObject(_eventType, 1);
+                    _issuePluginEventMethod.Invoke(null, new object[] { disposeEvent, _plugin });
+                    _plugin = IntPtr.Zero;
+                }
+                if (_plugin == IntPtr.Zero)
+                {
+                    _plugin = (IntPtr)_createReceiverMethod.Invoke(null, new object[] { _sourceName });
+                    if (_plugin == IntPtr.Zero) return false;
+                    pluginField.SetValue(__instance, _plugin);
+                }
+
+                object updateEvent = Enum.ToObject(_eventType, 0);
+                _issuePluginEventMethod.Invoke(null, new object[] { updateEvent, _plugin });
+
+                IntPtr texturePointer = (IntPtr)_getTexturePointerMethod.Invoke(null, new object[] { _plugin });
+                int textureWidth = (int)_getTextureWidthMethod.Invoke(null, new object[] { _plugin });
+                int textureHeight = (int)_getTextureHeightMethod.Invoke(null, new object[] { _plugin });
+
+                Texture2D _sharedTexture = (Texture2D)sharedTextureField.GetValue(__instance);
+                RenderTexture _receivedTexture = (RenderTexture)receivedTextureField.GetValue(__instance);
+
+                if (_sharedTexture != null && (textureWidth != _sharedTexture.width || textureHeight != _sharedTexture.height))
+                {
+                    _destroyMethod.Invoke(null, new object[] { _sharedTexture });
+                    if (!__instance.keepLastFrameOnTextureLost) _destroyMethod.Invoke(null, new object[] { _receivedTexture });
+                    _sharedTexture = null;
+                    sharedTextureField.SetValue(__instance, null);
+                }
+
+                if (_sharedTexture == null && texturePointer != IntPtr.Zero)
+                {
+                    _sharedTexture = Texture2D.CreateExternalTexture(textureWidth, textureHeight, TextureFormat.ARGB32, false, false, texturePointer);
+                    _sharedTexture.hideFlags = HideFlags.DontSave;
+                    sharedTextureField.SetValue(__instance, _sharedTexture);
+                    _destroyMethod.Invoke(null, new object[] { _receivedTexture });
+                }
+                else if (_sharedTexture == null && _receivedTexture != null && !__instance.keepLastFrameOnTextureLost)
+                {
+                    _destroyMethod.Invoke(null, new object[] { _receivedTexture });
+                }
+
+                if (_sharedTexture != null)
+                {
+                    Vector2 scale = new Vector2(1, -1);
+                    Vector2 offset = new Vector2(0, 1);
+
+                    RenderTexture _targetTexture = (RenderTexture)targetTextureField.GetValue(__instance);
+                    if (_targetTexture != null)
+                    {
+                        Graphics.Blit(_sharedTexture, _targetTexture, scale, offset);
+                    }
+                    else
+                    {
+                        if (_receivedTexture == null)
+                        {
+                            // FIX: Use the default (linear) color space to match the game's rendering pipeline.
+                            _receivedTexture = new RenderTexture(_sharedTexture.width, _sharedTexture.height, 0);
+                            _receivedTexture.hideFlags = HideFlags.DontSave;
+                            receivedTextureField.SetValue(__instance, _receivedTexture);
+                        }
+                        Graphics.Blit(_sharedTexture, _receivedTexture, scale, offset);
+                    }
+                }
+
+                // The rest of the original method is for applying to a target renderer, which we don't use.
+            }
+            catch (Exception e)
+            {
+                Logger.Error($"[CaptureCore] Exception in OnSpoutUpdatePrefix: {e}");
+                return false; // Prevent original from running and crashing
+            }
+
+            return false; // Skip original Update
         }
     }
 }

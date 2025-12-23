@@ -38,7 +38,7 @@ To hide the mouse cursor in the capture, add `--no-cursor` after the window titl
 
 **Example `MyGame.win`:**
 ```text
-"My Game Window Title" --no-cursor
+My Game Window Title --no-cursor
 ```
 
 ## Requirements

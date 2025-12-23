@@ -55,7 +55,7 @@ My Game Window Title --no-cursor
 
 ## Troubleshooting
 
-*   **Black Screen:** Ensure the window you are trying to capture is not minimized.
+*   **Static is Being Shown On the Screen when i power on the System:** Ensure that `SpoutWGCSender.exe` is set to run on the same GPU as EmuVR
 *   **Game doesn't launch:** Check your `.bat` file by running it manually outside of EmuVR to ensure it works.
 *   **Window not found:** Ensure the text in your `.win` file matches the window title exactly (case-insensitive).
 

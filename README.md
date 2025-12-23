@@ -33,7 +33,15 @@ To have EmuVR launch the game for you:
     *   Steam Example: `start steam://rungameid/782330`
 4.  When you turn on the System in EmuVR, the mod will execute the `.bat` file and wait for the window specified in the `.win` file to appear.
 
-### 3. Hiding the Cursor
+### 3. Using Spout Senders
+1.  Navigate to your `EmuVR\Games` folder.
+2.  Create a new text file and name it something like `OBS.win` (make sure the extension is `.win`).
+3.  Open the file with a text editor (Notepad).
+4.  Type `spout:` followed immediately by the **Sender Name** you set in OBS.
+    *   Example: `spout:OBS_Output`
+5.  Save and close the file.
+
+### 4. Hiding the Cursor
 To hide the mouse cursor in the capture, add `--no-cursor` after the window title in your `.win` file.
 
 **Example `MyGame.win`:**

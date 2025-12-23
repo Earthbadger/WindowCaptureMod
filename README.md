@@ -12,6 +12,7 @@ MelonLoader Window Capture Mod For EmuVR Built Using Spout And Windows Graphics 
 2.  Copy `WindowCaptureMod.dll` to your `EmuVR\Mods` folder.
 3.  Create a folder named `WindowCapture` inside `EmuVR\UserData`.
 4.  Copy `SpoutWGCSender.exe` & `SpoutDX.dll` to `EmuVR\UserData\WindowCapture\`.
+5. Make sure `SpoutWGCSender.exe` & EmuVR are set to run on the same GPU
 
 ## Usage
 
@@ -55,7 +56,7 @@ My Game Window Title --no-cursor
 
 ## Troubleshooting
 
-*   **Static is Being Shown On the Screen when i power on the System:** Ensure that `SpoutWGCSender.exe` is set to run on the same GPU as EmuVR
+*   **Static is Being Shown On the Screen when I power on the System:** Ensure that `SpoutWGCSender.exe` is set to run on the same GPU as EmuVR
 *   **Game doesn't launch:** Check your `.bat` file by running it manually outside of EmuVR to ensure it works.
 *   **Window not found:** Ensure the text in your `.win` file matches the window title exactly (case-insensitive).
 

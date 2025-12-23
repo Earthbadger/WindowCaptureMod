@@ -73,8 +73,6 @@ namespace WIGUx.Modules.WindowCaptureModule
 
     public class WindowCaptureInstance : MonoBehaviour
     {
-        private string windowIdentifier;
-        private string spoutName;
         private Process captureProcess;
         private Process gameProcess;
 
@@ -103,14 +101,16 @@ namespace WIGUx.Modules.WindowCaptureModule
                 gameProcess = null;
             }
             if (spoutReceiver != null) Destroy(spoutReceiver);
-            if (screenController != null) screenController.receivingTexture = false;
+            if (screenController != null)
+            {
+                screenController.receivingTexture = false;
+                screenController.EnableOffTexture();
+            }
             if (screenRenderer != null) screenRenderer.SetPropertyBlock(null);
         }
 
         public void Initialize(string windowName, bool hideCursor, string launchPath)
         {
-            this.windowIdentifier = windowName;
-            
             // 0. Launch Game Process if requested
             if (!string.IsNullOrEmpty(launchPath))
             {
@@ -140,21 +140,22 @@ namespace WIGUx.Modules.WindowCaptureModule
 
             bool isExternalSpout = windowName.StartsWith("spout:", StringComparison.OrdinalIgnoreCase);
 
+            string spoutSourceName;
             if (isExternalSpout)
             {
-                this.spoutName = windowName.Substring(6);
-                CaptureCore.Logger.Msg($"[CaptureCore] Connecting to external Spout sender: {this.spoutName}");
+                spoutSourceName = windowName.Substring(6);
+                CaptureCore.Logger.Msg($"[CaptureCore] Connecting to external Spout sender: {spoutSourceName}");
             }
             else
             {
-                this.spoutName = "GameCaptureWGC";
+                spoutSourceName = "GameCaptureWGC";
                 // Start the capture loop to wait for the window and handle launchers
                 StartCoroutine(CaptureLoop(windowName, hideCursor));
             }
 
             // 2. Setup Spout Receiver (Video)
             spoutReceiver = gameObject.AddComponent<SpoutReceiver>();
-            spoutReceiver.sourceName = spoutName;
+            spoutReceiver.sourceName = spoutSourceName;
         }
 
         private IEnumerator CaptureLoop(string windowName, bool hideCursor)
@@ -285,14 +286,29 @@ namespace WIGUx.Modules.WindowCaptureModule
             // Check if the system is running
             if (hasTexture && gameSystem.retroarchIsRunning)
             {
-                screenController.receivingTexture = true;
-                screenController.LightColor = Color.black;
-                screenController.LightIntensity = 0f;
+                // Fix for static/black screen: Ensure ScreenController knows we are providing a texture and TV is on.
+                if (!screenController.receivingTexture) screenController.receivingTexture = true;
+                if (!screenController.NetworktvOn) screenController.NetworktvOn = true;
+                
+                // Force the screen material to ensure we aren't rendering on the static/off material
+                if (screenRenderer.sharedMaterial != screenController.screenMaterial)
+                {
+                    screenRenderer.sharedMaterial = screenController.screenMaterial;
+                }
 
-                screenRenderer.GetPropertyBlock(screenPropertyBlock);
+                // CRITICAL FIX: Do NOT get the current property block from the renderer.
+                // It contains leftover scaling/offset values from the static animation which cause stretching.
+                // Instead, start with a clean block to reset all unspecified properties to material defaults.
+                screenPropertyBlock.Clear();
                 screenPropertyBlock.SetColor("_Color", Color.black);
                 screenPropertyBlock.SetColor("_EmissionColor", Color.white);
                 screenPropertyBlock.SetTexture("_EmissionMap", receivedTexture);
+                
+                // CRITICAL FIX: Reset EmissionMap scale/offset. 
+                // ScreenController modifies this for static noise, which distorts our capture if not reset.
+                screenPropertyBlock.SetVector("_EmissionMap_ST", new Vector4(1, 1, 0, 0));
+                // Reset texture scale/offset to prevent interference from static animation
+                screenPropertyBlock.SetVector("_MainTex_ST", new Vector4(1, 1, 0, 0));
 
                 // Aspect Ratio Correction
                 if (screenAspectRatioField != null && overscanField != null)

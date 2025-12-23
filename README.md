@@ -11,7 +11,7 @@ MelonLoader Window Capture Mod For EmuVR Built Using Spout And Windows Graphics 
 1.  Download the latest release.
 2.  Copy `WindowCaptureMod.dll` to your `EmuVR\Mods` folder.
 3.  Create a folder named `WindowCapture` inside `EmuVR\UserData`.
-4.  Copy `SpoutWGCSender.exe` to `EmuVR\UserData\WindowCapture\`.
+4.  Copy `SpoutWGCSender.exe` & `SpoutDX.dll` to `EmuVR\UserData\WindowCapture\`.
 
 ## Usage
 

@@ -37,7 +37,7 @@ To have EmuVR launch the game for you:
 1.  Navigate to your `EmuVR\Games` folder.
 2.  Create a new text file and name it something like `OBS.win` (make sure the extension is `.win`).
 3.  Open the file with a text editor (Notepad).
-4.  Type `spout:` followed immediately by the **Sender Name** you set in OBS.
+4.  Type `spout:` followed immediately by the **Sender Name**.
     *   Example: `spout:OBS_Output`
 5.  Save and close the file.
 

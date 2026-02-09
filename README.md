@@ -2,6 +2,8 @@
 
 MelonLoader Window Capture Mod For EmuVR Built Using Spout And Windows Graphics Capture
 
+## THIS IS UNOFFICAL MODDED CONTENT DO NOT ASK ANY QUESTIONS ABOUT THIS CONTENT IN THE OFFICAL EMUVR DISCORD SERVER
+Support will only be given in Issues or This Discord Server
 Discuss With Other Users: https://discord.gg/9RgA5F8SGn
 
 ## Features
